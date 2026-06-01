@@ -39,10 +39,10 @@ Invoke-Checked { cargo zigbuild --help | Out-Null } "cargo zigbuild check"
 
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 
-Invoke-Checked { cargo build --release --target $WindowsTarget } "Windows build"
+Invoke-Checked { cargo build --release --target $WindowsTarget --bin erp } "Windows build"
 Copy-Item -Force "target\$WindowsTarget\release\erp.exe" "$DistDir\erp-$WindowsTarget.exe"
 
-Invoke-Checked { cargo zigbuild --release --target $LinuxTarget } "Linux zigbuild"
+Invoke-Checked { cargo zigbuild --release --target $LinuxTarget --bin erp } "Linux zigbuild"
 
 $linuxCandidates = @(
     "target\$LinuxTarget\release\erp",

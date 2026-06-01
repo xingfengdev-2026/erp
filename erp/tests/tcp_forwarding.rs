@@ -1,4 +1,8 @@
-use std::{net::TcpListener as StdTcpListener, path::Path, process::Stdio};
+use std::{
+    net::TcpListener as StdTcpListener,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use tempfile::TempDir;
 use tokio::{
@@ -47,12 +51,26 @@ async fn start_echo(addr: String) {
 }
 
 fn spawn_erp(args: &[&str]) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_erp"))
+    Command::new(erp_binary())
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap()
+}
+
+fn erp_binary() -> PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_erp") {
+        return PathBuf::from(path);
+    }
+
+    let mut path = std::env::current_exe().unwrap();
+    path.pop();
+    if path.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        path.pop();
+    }
+    path.push(if cfg!(windows) { "erp.exe" } else { "erp" });
+    path
 }
 
 fn write_configs(

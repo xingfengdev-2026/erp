@@ -9,24 +9,21 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  rust:
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            name: erp-x86_64-unknown-linux-musl
             bin: erp
             artifact: erp-x86_64-unknown-linux-musl
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            name: erp-x86_64-pc-windows-msvc
             bin: erp.exe
             artifact: erp-x86_64-pc-windows-msvc.exe
           - os: macos-latest
             target: x86_64-apple-darwin
-            name: erp-x86_64-apple-darwin
             bin: erp
             artifact: erp-x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -35,13 +32,44 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        working-directory: erp
+        run: cargo build --release --target ${{ matrix.target }} --bin erp
       - name: Stage artifact
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          cp "erp/target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Install dependencies
+        working-directory: erp-gui
+        run: flutter pub get
+      - name: Build Android APK
+        working-directory: erp-gui
+        run: flutter build apk --release
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp erp-gui/build/app/outputs/flutter-apk/app-release.apk dist/erp-gui-android.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/erp-gui-android.apk

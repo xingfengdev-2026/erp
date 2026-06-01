@@ -1,2 +1,8 @@
-/target
-/dist
+/erp/target
+/erp/dist
+/erp-gui/build
+/erp-gui/.dart_tool
+/erp-gui/.flutter-plugins
+/erp-gui/.flutter-plugins-dependencies
+/erp-gui/.metadata
+*.iml

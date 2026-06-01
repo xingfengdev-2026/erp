@@ -3,6 +3,10 @@ name = "erp"
 version = "0.1.1"
 edition = "2024"
 
+[lib]
+name = "erp_core"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 aes-gcm = "0.10"
 anyhow = "1"
