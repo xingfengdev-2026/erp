@@ -65,7 +65,11 @@ jobs:
         run: |
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$ANDROID_HOME/cmdline-tools/bin/sdkmanager"; fi
+          set +o pipefail
           yes | "$SDKMANAGER" --install "ndk;27.0.12077973"
+          status=${PIPESTATUS[1]}
+          set -o pipefail
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
       - name: Build bundled erp runtime
