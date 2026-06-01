@@ -19,17 +19,14 @@ class ErpGuiApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const seed = Color(0xff1f6f5b);
+    const seed = Color(0xff3f6f5f);
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'erp',
       theme: ThemeData(
         useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: seed,
-          brightness: Brightness.light,
-        ),
-        scaffoldBackgroundColor: const Color(0xfff4f7f2),
+        colorScheme: ColorScheme.fromSeed(seedColor: seed),
+        scaffoldBackgroundColor: const Color(0xfff7f8f5),
         cardTheme: CardThemeData(
           elevation: 0,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -40,10 +37,6 @@ class ErpGuiApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(
           seedColor: seed,
           brightness: Brightness.dark,
-        ),
-        cardTheme: CardThemeData(
-          elevation: 0,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         ),
       ),
       home: const HomePage(),
@@ -64,15 +57,17 @@ class _HomePageState extends State<HomePage> {
   final _socks = Socks5Server();
   final _bridge = NativeErpBridge();
   final _logs = <String>[];
+
   StreamSubscription<String>? _socksSub;
   StreamSubscription<String>? _bridgeSub;
-
   var _profiles = <ErpProfile>[];
   var _selectedIndex = 0;
   var _loading = true;
-  var _erpRunning = false;
+  var _busy = false;
+  String? _runningProfileId;
 
   ErpProfile get _profile => _profiles[_selectedIndex];
+  bool get _running => _runningProfileId != null;
 
   @override
   void initState() {
@@ -82,7 +77,8 @@ class _HomePageState extends State<HomePage> {
     _bridgeSub = _bridge.events.listen((message) {
       _log(message);
       if (message.startsWith('erp client exited') && mounted) {
-        setState(() => _erpRunning = false);
+        unawaited(_socks.stop());
+        setState(() => _runningProfileId = null);
       }
     });
   }
@@ -106,396 +102,174 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _persist() => _store.save(_profiles);
 
-  void _replaceSelected(ErpProfile profile) {
-    setState(() {
-      _profiles[_selectedIndex] = profile;
-    });
-    unawaited(_persist());
-  }
-
   void _log(String message) {
     if (!mounted) return;
     setState(() {
       final time = TimeOfDay.now().format(context);
       _logs.insert(0, '$time  $message');
-      if (_logs.length > 80) _logs.removeLast();
+      if (_logs.length > 60) _logs.removeLast();
     });
   }
 
-  Future<void> _toggleSocks() async {
-    if (_socks.running) {
-      await _socks.stop();
-    } else {
-      await _socks.start(port: _profile.socks5Port);
-    }
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _toggleErp() async {
+  Future<void> _toggleConnection() async {
+    if (_busy) return;
+    setState(() => _busy = true);
     try {
-      if (_erpRunning) {
-        await _bridge.stopClient();
-        _log('erp client stopped');
+      if (_running) {
+        await _stopRuntime();
       } else {
-        await _bridge.startClient(_profile);
-      }
-      if (mounted) {
-        setState(() => _erpRunning = _bridge.state == ErpRuntimeState.running);
+        await _startRuntime(_profile);
       }
     } catch (error) {
-      _log('erp client failed: $error');
+      _log('connect failed: $error');
+      await _socks.stop();
+      await _bridge.stopClient();
+      if (mounted) setState(() => _runningProfileId = null);
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
-  Future<void> _copyToml() async {
-    await Clipboard.setData(ClipboardData(text: _bridge.renderToml(_profile)));
-    _log('client TOML copied');
+  Future<void> _startRuntime(ErpProfile profile) async {
+    if (profile.exposesSocks5) {
+      await _socks.stop();
+      await _socks.start(port: profile.localPort);
+    }
+    await _bridge.startClient(profile);
+    setState(() => _runningProfileId = profile.id);
+    _log('connected ${profile.name}');
+  }
+
+  Future<void> _stopRuntime() async {
+    await _bridge.stopClient();
+    await _socks.stop();
+    setState(() => _runningProfileId = null);
+    _log('disconnected');
   }
 
   Future<void> _addProfile() async {
-    final profile = ErpProfile.starter().copyWith(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
-      name: 'Android SOCKS5 ${_profiles.length + 1}',
+    final edited = await showDialog<ErpProfile>(
+      context: context,
+      builder: (_) => ConfigEditorDialog(
+        profile: ErpProfile.starter().copyWith(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          name: 'Config ${_profiles.length + 1}',
+        ),
+        title: 'Add config',
+      ),
     );
+    if (edited == null) return;
     setState(() {
-      _profiles.add(profile);
+      _profiles.add(edited);
       _selectedIndex = _profiles.length - 1;
     });
     await _persist();
   }
 
-  Future<void> _deleteProfile() async {
-    if (_profiles.length == 1) return;
+  Future<void> _editProfile(int index) async {
+    final edited = await showDialog<ErpProfile>(
+      context: context,
+      builder: (_) =>
+          ConfigEditorDialog(profile: _profiles[index], title: 'Edit config'),
+    );
+    if (edited == null) return;
+    setState(() => _profiles[index] = edited);
+    await _persist();
+  }
+
+  Future<void> _deleteProfile(int index) async {
+    final deletingRunning = _profiles[index].id == _runningProfileId;
+    if (deletingRunning) await _stopRuntime();
     setState(() {
-      _profiles.removeAt(_selectedIndex);
-      _selectedIndex = 0;
+      _profiles.removeAt(index);
+      if (_profiles.isEmpty) {
+        _profiles.add(ErpProfile.starter());
+      }
+      _selectedIndex = _selectedIndex.clamp(0, _profiles.length - 1);
     });
     await _persist();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    if (_loading) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
-    return Scaffold(
-      body: SafeArea(
-        child: CustomScrollView(
-          slivers: [
-            SliverToBoxAdapter(child: _HeroHeader(profile: _profile)),
-            SliverPadding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-              sliver: SliverList.list(
+  Future<void> _showShare(ErpProfile profile) async {
+    var encrypted = false;
+    var link = _share.encodePlain(profile);
+    final passController = TextEditingController();
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          final messenger = ScaffoldMessenger.of(dialogContext);
+          Future<void> rebuildLink() async {
+            try {
+              final next = encrypted
+                  ? await _share.encodeEncrypted(profile, passController.text)
+                  : _share.encodePlain(profile);
+              setDialogState(() => link = next);
+            } catch (error) {
+              messenger.showSnackBar(
+                SnackBar(content: Text('Share failed: $error')),
+              );
+            }
+          }
+
+          return AlertDialog(
+            title: Text('Share ${profile.name}'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  _profileSelector(),
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(value: false, label: Text('Plain')),
+                      ButtonSegment(value: true, label: Text('Encrypted')),
+                    ],
+                    selected: {encrypted},
+                    onSelectionChanged: (values) async {
+                      encrypted = values.first;
+                      await rebuildLink();
+                    },
+                  ),
+                  if (encrypted) ...[
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: passController,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Passphrase',
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (_) => unawaited(rebuildLink()),
+                    ),
+                  ],
+                  const SizedBox(height: 16),
+                  QrImageView(
+                    data: link,
+                    size: 220,
+                    backgroundColor: Colors.white,
+                  ),
                   const SizedBox(height: 12),
-                  _statusPanel(),
-                  const SizedBox(height: 12),
-                  _mappingPanel(),
-                  const SizedBox(height: 12),
-                  _sharePanel(),
-                  const SizedBox(height: 12),
-                  _logPanel(),
+                  SelectableText(link),
                 ],
               ),
             ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _profileSelector() {
-    return Row(
-      children: [
-        Expanded(
-          child: DropdownButtonFormField<int>(
-            initialValue: _selectedIndex,
-            decoration: const InputDecoration(
-              labelText: 'Profile',
-              border: OutlineInputBorder(),
-            ),
-            items: [
-              for (var i = 0; i < _profiles.length; i++)
-                DropdownMenuItem(value: i, child: Text(_profiles[i].name)),
-            ],
-            onChanged: (value) => setState(() => _selectedIndex = value ?? 0),
-          ),
-        ),
-        const SizedBox(width: 8),
-        IconButton.filledTonal(
-          tooltip: 'Add profile',
-          onPressed: _addProfile,
-          icon: const Icon(Icons.add),
-        ),
-        const SizedBox(width: 8),
-        IconButton.filledTonal(
-          tooltip: 'Edit profile',
-          onPressed: _editProfile,
-          icon: const Icon(Icons.tune),
-        ),
-        if (_profiles.length > 1) ...[
-          const SizedBox(width: 8),
-          IconButton.filledTonal(
-            tooltip: 'Delete profile',
-            onPressed: _deleteProfile,
-            icon: const Icon(Icons.delete_outline),
-          ),
-        ],
-      ],
-    );
-  }
-
-  Widget _statusPanel() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                _StatusPill(
-                  label: _socks.running
-                      ? 'SOCKS5 ${_socks.tcpPort}'
-                      : 'SOCKS5 off',
-                  active: _socks.running,
-                ),
-                const SizedBox(width: 8),
-                _StatusPill(
-                  label: _erpRunning ? 'erp running' : 'erp stopped',
-                  active: _erpRunning,
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            Text(
-              _profile.serverAddr,
-              style: Theme.of(
-                context,
-              ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              'client_id: ${_profile.clientId}  •  ${_profile.transport.wire}',
-            ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _toggleSocks,
-                    icon: Icon(_socks.running ? Icons.stop : Icons.lan),
-                    label: Text(
-                      _socks.running ? 'Stop SOCKS5' : 'Start SOCKS5',
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: FilledButton.tonalIcon(
-                    onPressed: _toggleErp,
-                    icon: Icon(_erpRunning ? Icons.pause : Icons.play_arrow),
-                    label: Text(_erpRunning ? 'Stop erp' : 'Start erp'),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: _copyToml,
-                icon: const Icon(Icons.description_outlined),
-                label: const Text('Copy client TOML'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('Close'),
               ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _mappingPanel() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    'Mappings',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-                TextButton.icon(
-                  onPressed: _addMapping,
-                  icon: const Icon(Icons.add),
-                  label: const Text('Add'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            for (final mapping in _profile.mappings)
-              _MappingTile(
-                mapping: mapping,
-                onEdit: () => _editMapping(mapping),
-                onDelete: () {
-                  final mappings = _profile.mappings
-                      .where((m) => m != mapping)
-                      .toList();
-                  _replaceSelected(_profile.copyWith(mappings: mappings));
+              FilledButton.icon(
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: link));
+                  Navigator.pop(dialogContext);
+                  _log('share link copied');
                 },
+                icon: const Icon(Icons.copy),
+                label: const Text('Copy'),
               ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _sharePanel() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Share',
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _showExport,
-                    icon: const Icon(Icons.qr_code_2),
-                    label: const Text('Export QR/link'),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _showImport,
-                    icon: const Icon(Icons.input),
-                    label: const Text('Import erp://'),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _logPanel() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Activity',
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 8),
-            if (_logs.isEmpty) const Text('No activity yet.'),
-            for (final log in _logs.take(8))
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 3),
-                child: Text(log, style: Theme.of(context).textTheme.bodySmall),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _editProfile() async {
-    final edited = await showDialog<ErpProfile>(
-      context: context,
-      builder: (_) => ProfileDialog(profile: _profile),
-    );
-    if (edited != null) _replaceSelected(edited);
-  }
-
-  Future<void> _addMapping() async {
-    final mapping = await showDialog<ErpMapping>(
-      context: context,
-      builder: (_) => MappingDialog(
-        mapping: ErpMapping(
-          name: 'socks5',
-          protocol: ErpProtocol.tcp,
-          localAddr: '127.0.0.1:${_profile.socks5Port}',
-          remotePort: 18080,
-        ),
-      ),
-    );
-    if (mapping != null) {
-      _replaceSelected(
-        _profile.copyWith(mappings: [..._profile.mappings, mapping]),
-      );
-    }
-  }
-
-  Future<void> _editMapping(ErpMapping mapping) async {
-    final edited = await showDialog<ErpMapping>(
-      context: context,
-      builder: (_) => MappingDialog(mapping: mapping),
-    );
-    if (edited != null) {
-      final mappings = _profile.mappings
-          .map((m) => m == mapping ? edited : m)
-          .toList();
-      _replaceSelected(_profile.copyWith(mappings: mappings));
-    }
-  }
-
-  Future<void> _showExport() async {
-    final passphrase = await _askPassphrase('Encrypt profile');
-    if (passphrase == null || passphrase.isEmpty) return;
-    final link = await _share.encode(_profile, passphrase);
-    if (!mounted) return;
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Export profile'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              QrImageView(data: link, size: 220, backgroundColor: Colors.white),
-              const SizedBox(height: 12),
-              SelectableText(link),
             ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Clipboard.setData(ClipboardData(text: link));
-              Navigator.pop(context);
-              _log('erp:// link copied');
-            },
-            child: const Text('Copy link'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-        ],
+          );
+        },
       ),
     );
   }
@@ -506,7 +280,7 @@ class _HomePageState extends State<HomePage> {
     final profile = await showDialog<ErpProfile>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Import profile'),
+        title: const Text('Import erp://'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -514,13 +288,19 @@ class _HomePageState extends State<HomePage> {
               controller: linkController,
               minLines: 3,
               maxLines: 5,
-              decoration: const InputDecoration(labelText: 'erp:// link'),
+              decoration: const InputDecoration(
+                labelText: 'erp:// link',
+                border: OutlineInputBorder(),
+              ),
             ),
             const SizedBox(height: 12),
             TextField(
               controller: passController,
               obscureText: true,
-              decoration: const InputDecoration(labelText: 'Passphrase'),
+              decoration: const InputDecoration(
+                labelText: 'Passphrase if encrypted',
+                border: OutlineInputBorder(),
+              ),
             ),
           ],
         ),
@@ -538,7 +318,11 @@ class _HomePageState extends State<HomePage> {
                   linkController.text,
                   passController.text,
                 );
-                navigator.pop(imported);
+                navigator.pop(
+                  imported.copyWith(
+                    id: DateTime.now().microsecondsSinceEpoch.toString(),
+                  ),
+                );
               } catch (error) {
                 messenger.showSnackBar(
                   SnackBar(content: Text('Import failed: $error')),
@@ -550,344 +334,411 @@ class _HomePageState extends State<HomePage> {
         ],
       ),
     );
-    if (profile != null) {
-      setState(() {
-        _profiles.add(
-          profile.copyWith(
-            id: DateTime.now().microsecondsSinceEpoch.toString(),
-          ),
-        );
-        _selectedIndex = _profiles.length - 1;
-      });
-      await _persist();
-      _log('Imported ${profile.name}');
-    }
+    if (profile == null) return;
+    setState(() {
+      _profiles.add(profile);
+      _selectedIndex = _profiles.length - 1;
+    });
+    await _persist();
   }
-
-  Future<String?> _askPassphrase(String title) {
-    final controller = TextEditingController();
-    return showDialog<String>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: Text(title),
-        content: TextField(
-          controller: controller,
-          obscureText: true,
-          decoration: const InputDecoration(labelText: 'Passphrase'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text),
-            child: const Text('Continue'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _HeroHeader extends StatelessWidget {
-  const _HeroHeader({required this.profile});
-
-  final ErpProfile profile;
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.fromLTRB(20, 24, 20, 20),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [scheme.primary, scheme.tertiaryContainer],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.hub, color: Colors.white, size: 30),
-              const SizedBox(width: 10),
-              Text(
-                'erp',
-                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w800,
+    if (_loading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final runningName = _profiles
+        .where((profile) => profile.id == _runningProfileId)
+        .map((profile) => profile.name)
+        .firstOrNull;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('erp'),
+        actions: [
+          IconButton(
+            tooltip: 'Add config',
+            onPressed: _addProfile,
+            icon: const Icon(Icons.add),
+          ),
+          PopupMenuButton<String>(
+            tooltip: 'More',
+            onSelected: (value) {
+              if (value == 'import') unawaited(_showImport());
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(
+                value: 'import',
+                child: ListTile(
+                  leading: Icon(Icons.input),
+                  title: Text('Import erp://'),
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 16),
-          Text(
-            profile.name,
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              color: Colors.white,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Expose Android SOCKS5 through a portable erp client profile.',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: Colors.white.withValues(alpha: 0.86),
-            ),
-          ),
         ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _busy ? null : _toggleConnection,
+        icon: Icon(_running ? Icons.link_off : Icons.link),
+        label: Text(_running ? 'Disconnect' : 'Connect'),
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 96),
+          children: [
+            if (_running)
+              _StatusBanner(
+                label: 'Connected: ${runningName ?? 'unknown'}',
+                active: true,
+              )
+            else
+              const _StatusBanner(label: 'Disconnected', active: false),
+            const SizedBox(height: 8),
+            for (var i = 0; i < _profiles.length; i++)
+              _ConfigTile(
+                profile: _profiles[i],
+                selected: i == _selectedIndex,
+                running: _profiles[i].id == _runningProfileId,
+                onTap: () => setState(() => _selectedIndex = i),
+                onShare: () => _showShare(_profiles[i]),
+                onEdit: () => _editProfile(i),
+                onDelete: () => _deleteProfile(i),
+              ),
+            if (_logs.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _ActivityPanel(logs: _logs),
+            ],
+          ],
+        ),
       ),
     );
   }
 }
 
-class _StatusPill extends StatelessWidget {
-  const _StatusPill({required this.label, required this.active});
+class _StatusBanner extends StatelessWidget {
+  const _StatusBanner({required this.label, required this.active});
 
   final String label;
   final bool active;
 
   @override
   Widget build(BuildContext context) {
-    final color = active ? Colors.green : Theme.of(context).colorScheme.outline;
+    final scheme = Theme.of(context).colorScheme;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(99),
-        border: Border.all(color: color),
+        color: active
+            ? scheme.primaryContainer
+            : scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
       ),
       child: Row(
-        mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.circle, size: 9, color: color),
-          const SizedBox(width: 6),
-          Text(label),
+          Icon(active ? Icons.check_circle : Icons.radio_button_unchecked),
+          const SizedBox(width: 10),
+          Expanded(child: Text(label)),
         ],
       ),
     );
   }
 }
 
-class _MappingTile extends StatelessWidget {
-  const _MappingTile({
-    required this.mapping,
+class _ConfigTile extends StatelessWidget {
+  const _ConfigTile({
+    required this.profile,
+    required this.selected,
+    required this.running,
+    required this.onTap,
+    required this.onShare,
     required this.onEdit,
     required this.onDelete,
   });
 
-  final ErpMapping mapping;
+  final ErpProfile profile;
+  final bool selected;
+  final bool running;
+  final VoidCallback onTap;
+  final VoidCallback onShare;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
-    final udp = mapping.udpMode == null ? '' : ' • ${mapping.udpMode!.wire}';
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      leading: Icon(
-        mapping.protocol == ErpProtocol.tcp
-            ? Icons.settings_ethernet
-            : Icons.radar,
+    final scheme = Theme.of(context).colorScheme;
+    final mapping = profile.primaryMapping;
+    final udp = mapping.udpMode == null ? '' : ' / ${mapping.udpMode!.wire}';
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 5),
+      color: selected ? scheme.secondaryContainer : null,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
+          child: Row(
+            children: [
+              Icon(
+                running
+                    ? Icons.cloud_done
+                    : selected
+                    ? Icons.radio_button_checked
+                    : Icons.radio_button_unchecked,
+                color: running || selected ? scheme.primary : scheme.outline,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            profile.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.titleMedium
+                                ?.copyWith(fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        _KindChip(label: profile.kind.label),
+                      ],
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      profile.serverAddr,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${mapping.localAddr} -> :${mapping.remotePort}  ${mapping.protocol.wire}$udp',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    Text(
+                      '${profile.clientId} / ${profile.transport.wire}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: 'Share',
+                onPressed: onShare,
+                icon: const Icon(Icons.qr_code_2),
+              ),
+              IconButton(
+                tooltip: 'Edit',
+                onPressed: onEdit,
+                icon: const Icon(Icons.edit_outlined),
+              ),
+              IconButton(
+                tooltip: 'Delete',
+                onPressed: onDelete,
+                icon: const Icon(Icons.delete_outline),
+              ),
+            ],
+          ),
+        ),
       ),
-      title: Text(mapping.name),
-      subtitle: Text(
-        '${mapping.localAddr}  →  :${mapping.remotePort}  •  ${mapping.protocol.wire}$udp',
+    );
+  }
+}
+
+class _KindChip extends StatelessWidget {
+  const _KindChip({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(99),
       ),
-      trailing: Wrap(
-        spacing: 4,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        child: Text(label, style: Theme.of(context).textTheme.labelSmall),
+      ),
+    );
+  }
+}
+
+class _ActivityPanel extends StatelessWidget {
+  const _ActivityPanel({required this.logs});
+
+  final List<String> logs;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          IconButton(
-            tooltip: 'Edit',
-            onPressed: onEdit,
-            icon: const Icon(Icons.edit),
+          Text(
+            'Activity',
+            style: Theme.of(
+              context,
+            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
           ),
-          IconButton(
-            tooltip: 'Delete',
-            onPressed: onDelete,
-            icon: const Icon(Icons.delete_outline),
-          ),
+          const SizedBox(height: 6),
+          for (final log in logs.take(6))
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Text(log, style: Theme.of(context).textTheme.bodySmall),
+            ),
         ],
       ),
     );
   }
 }
 
-class ProfileDialog extends StatefulWidget {
-  const ProfileDialog({super.key, required this.profile});
+class ConfigEditorDialog extends StatefulWidget {
+  const ConfigEditorDialog({
+    super.key,
+    required this.profile,
+    required this.title,
+  });
 
   final ErpProfile profile;
+  final String title;
 
   @override
-  State<ProfileDialog> createState() => _ProfileDialogState();
+  State<ConfigEditorDialog> createState() => _ConfigEditorDialogState();
 }
 
-class _ProfileDialogState extends State<ProfileDialog> {
+class _ConfigEditorDialogState extends State<ConfigEditorDialog> {
   late final TextEditingController name;
   late final TextEditingController serverAddr;
   late final TextEditingController clientId;
   late final TextEditingController token;
-  late final TextEditingController socksPort;
-  late ErpTransport transport;
-
-  @override
-  void initState() {
-    super.initState();
-    name = TextEditingController(text: widget.profile.name);
-    serverAddr = TextEditingController(text: widget.profile.serverAddr);
-    clientId = TextEditingController(text: widget.profile.clientId);
-    token = TextEditingController(text: widget.profile.token);
-    socksPort = TextEditingController(
-      text: widget.profile.socks5Port.toString(),
-    );
-    transport = widget.profile.transport;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Profile settings'),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: name,
-              decoration: const InputDecoration(labelText: 'Name'),
-            ),
-            TextField(
-              controller: serverAddr,
-              decoration: const InputDecoration(labelText: 'Server address'),
-            ),
-            TextField(
-              controller: clientId,
-              decoration: const InputDecoration(labelText: 'Client id'),
-            ),
-            TextField(
-              controller: token,
-              obscureText: true,
-              decoration: const InputDecoration(labelText: 'Token'),
-            ),
-            TextField(
-              controller: socksPort,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Local SOCKS5 port'),
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<ErpTransport>(
-              initialValue: transport,
-              decoration: const InputDecoration(labelText: 'Transport'),
-              items: [
-                for (final t in ErpTransport.values)
-                  DropdownMenuItem(value: t, child: Text(t.wire)),
-              ],
-              onChanged: (value) =>
-                  setState(() => transport = value ?? ErpTransport.raw),
-            ),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Cancel'),
-        ),
-        TextButton(
-          onPressed: () => Navigator.pop(context, null),
-          child: const Text('Delete'),
-        ),
-        FilledButton(
-          onPressed: () {
-            Navigator.pop(
-              context,
-              widget.profile.copyWith(
-                name: name.text,
-                serverAddr: serverAddr.text,
-                clientId: clientId.text,
-                token: token.text,
-                transport: transport,
-                socks5Port: int.tryParse(socksPort.text) ?? 1080,
-              ),
-            );
-          },
-          child: const Text('Save'),
-        ),
-      ],
-    );
-  }
-}
-
-class MappingDialog extends StatefulWidget {
-  const MappingDialog({super.key, required this.mapping});
-
-  final ErpMapping mapping;
-
-  @override
-  State<MappingDialog> createState() => _MappingDialogState();
-}
-
-class _MappingDialogState extends State<MappingDialog> {
-  late final TextEditingController name;
   late final TextEditingController localAddr;
   late final TextEditingController remotePort;
+  late ErpProfileKind kind;
+  late ErpTransport transport;
   late ErpProtocol protocol;
   late ErpUdpMode udpMode;
 
   @override
   void initState() {
     super.initState();
-    name = TextEditingController(text: widget.mapping.name);
-    localAddr = TextEditingController(text: widget.mapping.localAddr);
-    remotePort = TextEditingController(
-      text: widget.mapping.remotePort.toString(),
-    );
-    protocol = widget.mapping.protocol;
-    udpMode = widget.mapping.udpMode ?? ErpUdpMode.overTcp;
+    final mapping = widget.profile.primaryMapping;
+    name = TextEditingController(text: widget.profile.name);
+    serverAddr = TextEditingController(text: widget.profile.serverAddr);
+    clientId = TextEditingController(text: widget.profile.clientId);
+    token = TextEditingController(text: widget.profile.token);
+    localAddr = TextEditingController(text: mapping.localAddr);
+    remotePort = TextEditingController(text: mapping.remotePort.toString());
+    kind = widget.profile.kind;
+    transport = widget.profile.transport;
+    protocol = mapping.protocol;
+    udpMode = mapping.udpMode ?? ErpUdpMode.overTcp;
+  }
+
+  @override
+  void dispose() {
+    name.dispose();
+    serverAddr.dispose();
+    clientId.dispose();
+    token.dispose();
+    localAddr.dispose();
+    remotePort.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Mapping'),
+      title: Text(widget.title),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(
-              controller: name,
-              decoration: const InputDecoration(labelText: 'Name'),
+            SegmentedButton<ErpProfileKind>(
+              segments: [
+                for (final value in ErpProfileKind.values)
+                  ButtonSegment(value: value, label: Text(value.label)),
+              ],
+              selected: {kind},
+              onSelectionChanged: (values) {
+                setState(() {
+                  kind = values.first;
+                  if (kind == ErpProfileKind.socks5) {
+                    protocol = ErpProtocol.tcp;
+                  }
+                });
+              },
             ),
-            DropdownButtonFormField<ErpProtocol>(
-              initialValue: protocol,
-              decoration: const InputDecoration(labelText: 'Protocol'),
+            const SizedBox(height: 12),
+            _Field(controller: name, label: 'Name'),
+            _Field(controller: serverAddr, label: 'Server ip:port'),
+            _Field(controller: clientId, label: 'Client id'),
+            _Field(controller: token, label: 'Token', obscure: true),
+            DropdownButtonFormField<ErpTransport>(
+              initialValue: transport,
+              decoration: const InputDecoration(
+                labelText: 'Transport',
+                border: OutlineInputBorder(),
+              ),
               items: [
-                for (final p in ErpProtocol.values)
-                  DropdownMenuItem(value: p, child: Text(p.wire)),
+                for (final value in ErpTransport.values)
+                  DropdownMenuItem(value: value, child: Text(value.wire)),
               ],
               onChanged: (value) =>
-                  setState(() => protocol = value ?? ErpProtocol.tcp),
+                  setState(() => transport = value ?? ErpTransport.raw),
             ),
-            if (protocol == ErpProtocol.udp)
+            const SizedBox(height: 10),
+            if (kind == ErpProfileKind.forwarding) ...[
+              DropdownButtonFormField<ErpProtocol>(
+                initialValue: protocol,
+                decoration: const InputDecoration(
+                  labelText: 'Protocol',
+                  border: OutlineInputBorder(),
+                ),
+                items: [
+                  for (final value in ErpProtocol.values)
+                    DropdownMenuItem(value: value, child: Text(value.wire)),
+                ],
+                onChanged: (value) =>
+                    setState(() => protocol = value ?? ErpProtocol.tcp),
+              ),
+              const SizedBox(height: 10),
+            ],
+            if (protocol == ErpProtocol.udp) ...[
               DropdownButtonFormField<ErpUdpMode>(
                 initialValue: udpMode,
-                decoration: const InputDecoration(labelText: 'UDP mode'),
+                decoration: const InputDecoration(
+                  labelText: 'UDP mode',
+                  border: OutlineInputBorder(),
+                ),
                 items: [
-                  for (final m in ErpUdpMode.values)
-                    DropdownMenuItem(value: m, child: Text(m.wire)),
+                  for (final value in ErpUdpMode.values)
+                    DropdownMenuItem(value: value, child: Text(value.wire)),
                 ],
                 onChanged: (value) =>
                     setState(() => udpMode = value ?? ErpUdpMode.overTcp),
               ),
-            TextField(
+              const SizedBox(height: 10),
+            ],
+            _Field(
               controller: localAddr,
-              decoration: const InputDecoration(labelText: 'Local address'),
+              label: kind == ErpProfileKind.socks5
+                  ? 'Local SOCKS5 ip:port'
+                  : 'Local ip:port',
             ),
-            TextField(
+            _Field(
               controller: remotePort,
+              label: 'Remote port',
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Remote port'),
             ),
           ],
         ),
@@ -898,21 +749,63 @@ class _MappingDialogState extends State<MappingDialog> {
           child: const Text('Cancel'),
         ),
         FilledButton(
-          onPressed: () {
-            Navigator.pop(
-              context,
-              ErpMapping(
-                name: name.text,
-                protocol: protocol,
-                localAddr: localAddr.text,
-                remotePort: int.tryParse(remotePort.text) ?? 18080,
-                udpMode: protocol == ErpProtocol.udp ? udpMode : null,
-              ),
-            );
-          },
+          onPressed: () => Navigator.pop(context, _buildProfile()),
           child: const Text('Save'),
         ),
       ],
+    );
+  }
+
+  ErpProfile _buildProfile() {
+    final selectedProtocol = kind == ErpProfileKind.socks5
+        ? ErpProtocol.tcp
+        : protocol;
+    final mapping = ErpMapping(
+      name: kind == ErpProfileKind.socks5 ? 'socks5' : name.text.trim(),
+      protocol: selectedProtocol,
+      localAddr: localAddr.text.trim(),
+      remotePort: int.tryParse(remotePort.text.trim()) ?? 18080,
+      udpMode: selectedProtocol == ErpProtocol.udp ? udpMode : null,
+    );
+    return widget.profile.copyWith(
+      kind: kind,
+      name: name.text.trim().isEmpty ? widget.profile.name : name.text.trim(),
+      serverAddr: serverAddr.text.trim(),
+      clientId: clientId.text.trim(),
+      token: token.text,
+      transport: transport,
+      socks5Port: ErpProfile.parsePort(mapping.localAddr) ?? 1080,
+      mappings: [mapping],
+    );
+  }
+}
+
+class _Field extends StatelessWidget {
+  const _Field({
+    required this.controller,
+    required this.label,
+    this.obscure = false,
+    this.keyboardType,
+  });
+
+  final TextEditingController controller;
+  final String label;
+  final bool obscure;
+  final TextInputType? keyboardType;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: TextField(
+        controller: controller,
+        obscureText: obscure,
+        keyboardType: keyboardType,
+        decoration: InputDecoration(
+          labelText: label,
+          border: const OutlineInputBorder(),
+        ),
+      ),
     );
   }
 }

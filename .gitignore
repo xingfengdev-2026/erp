@@ -1,6 +1,7 @@
 /erp/target
 /erp/dist
 /erp-gui/build
+/erp-gui/android/app/src/main/jniLibs
 /erp-gui/.dart_tool
 /erp-gui/.flutter-plugins
 /erp-gui/.flutter-plugins-dependencies

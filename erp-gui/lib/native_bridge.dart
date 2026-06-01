@@ -2,11 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
+
 import 'models.dart';
 
 enum ErpRuntimeState { stopped, running }
 
 class NativeErpBridge {
+  static const _channel = MethodChannel('uk.nam2.erp/runtime');
+
   final _events = StreamController<String>.broadcast();
   Process? _process;
 
@@ -15,19 +19,16 @@ class NativeErpBridge {
 
   Future<void> startClient(ErpProfile profile) async {
     if (_process != null) return;
-    if (Platform.isAndroid || Platform.isIOS) {
-      throw UnsupportedError('Android native erp runtime is not bundled yet');
-    }
 
     final configFile = await _writeTempConfig(profile);
-    final executable = Platform.environment['ERP_BIN'] ?? _defaultExecutable();
+    final executable = await _resolveExecutable();
     _process = await Process.start(executable, [
       'client',
       '--config',
       configFile.path,
     ]);
     state = ErpRuntimeState.running;
-    _events.add('erp client process started with ${configFile.path}');
+    _events.add('erp client started: ${configFile.path}');
     _streamLines(_process!.stdout, 'erp');
     _streamLines(_process!.stderr, 'erp');
     unawaited(
@@ -60,6 +61,7 @@ class NativeErpBridge {
       ..writeln('server_addr = "${_escape(profile.serverAddr)}"')
       ..writeln('client_id = "${_escape(profile.clientId)}"')
       ..writeln();
+
     for (final mapping in profile.mappings) {
       buffer
         ..writeln('[[client.mappings]]')
@@ -75,9 +77,6 @@ class NativeErpBridge {
     return buffer.toString();
   }
 
-  String _escape(String value) =>
-      value.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
-
   Future<File> _writeTempConfig(ErpProfile profile) async {
     final safeId = profile.id.replaceAll(RegExp(r'[^a-zA-Z0-9_.-]'), '_');
     final file = File(
@@ -86,7 +85,24 @@ class NativeErpBridge {
     return file.writeAsString(renderToml(profile));
   }
 
-  String _defaultExecutable() => Platform.isWindows ? 'erp.exe' : 'erp';
+  Future<String> _resolveExecutable() async {
+    if (Platform.isAndroid) {
+      final nativeDir = await _channel.invokeMethod<String>('nativeLibraryDir');
+      if (nativeDir == null || nativeDir.isEmpty) {
+        throw StateError('Android native library directory is unavailable');
+      }
+      final binary = File('$nativeDir${Platform.pathSeparator}liberp_exec.so');
+      if (!await binary.exists()) {
+        throw StateError('Bundled erp runtime was not found for this ABI');
+      }
+      return binary.path;
+    }
+    return Platform.environment['ERP_BIN'] ??
+        (Platform.isWindows ? 'erp.exe' : 'erp');
+  }
+
+  String _escape(String value) =>
+      value.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
 
   void _streamLines(Stream<List<int>> stream, String prefix) {
     stream.transform(utf8.decoder).transform(const LineSplitter()).listen((

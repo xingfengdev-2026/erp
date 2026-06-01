@@ -5,13 +5,13 @@ Flutter GUI for managing `erp` client profiles.
 Current capabilities:
 
 - Create, edit, persist, and delete client profiles.
-- Configure TCP/UDP mappings, transport mode, token, client id, and server address.
-- Start a local Android/desktop SOCKS5 listener for profile mappings.
-- Export encrypted QR codes and `erp://import` links.
-- Import shared profiles with a passphrase.
-- Copy generated client TOML for use with the Rust CLI.
+- Configure SOCKS5 reverse proxy profiles or TCP/UDP forwarding nodes.
+- Select configs from a v2rayNG-style list with row-level share, edit, and delete actions.
+- Start a local Android/desktop SOCKS5 listener for SOCKS5 profiles.
+- Export plain QR codes or encrypted `erp://import` links.
+- Import plain or encrypted shared profiles.
 
-Desktop builds can start the Rust CLI directly when `erp` is on `PATH` or `ERP_BIN` points to a binary. Android currently includes the GUI, local SOCKS5 server, and sharing flows; the native Rust runtime bridge still needs to be packaged as an Android library before the Start erp button can launch tunnels on-device.
+Desktop builds start the Rust CLI directly when `erp` is on `PATH` or `ERP_BIN` points to a binary. Android APKs bundle the Rust CLI as `liberp_exec.so` for `arm64-v8a` and `x86_64`, then start the matching runtime from the app native library directory.
 
 ## Development
 
@@ -19,5 +19,7 @@ Desktop builds can start the Rust CLI directly when `erp` is on `PATH` or `ERP_B
 flutter pub get
 flutter analyze
 flutter test
-flutter build apk --debug
+.\tool\build_android_runtime.ps1
+flutter build apk --debug --split-per-abi --target-platform android-arm64,android-x64
+flutter build windows --release
 ```

@@ -7,7 +7,7 @@ This is a monorepo with two projects:
 - `erp/` contains the Rust CLI reverse proxy, examples, scripts, tests, and Rust-specific docs.
 - `erp-gui/` contains the Flutter GUI. App code lives in `erp-gui/lib/`, widget tests in `erp-gui/test/`, and Android packaging in `erp-gui/android/`.
 - Root `.github/workflows/` contains CI and release automation for both projects.
-- Generated folders such as `erp/target/`, `erp/dist/`, `erp-gui/build/`, and `erp-gui/.dart_tool/` must stay untracked.
+- Generated folders such as `erp/target/`, `erp/dist/`, `erp-gui/build/`, `erp-gui/.dart_tool/`, and generated Android `jniLibs/` must stay untracked.
 
 The Rust implementation plan remains in `erp/docs/PLAN.md`.
 
@@ -27,7 +27,9 @@ Run Flutter commands from `erp-gui/`:
 - `flutter pub get`: install Dart dependencies.
 - `flutter analyze`: run static analysis.
 - `flutter test`: run widget/unit tests.
-- `flutter build apk --debug`: build an Android debug APK.
+- `.\tool\build_android_runtime.ps1`: build bundled Android `erp` runtimes for `arm64-v8a` and `x86_64`.
+- `flutter build apk --debug --split-per-abi --target-platform android-arm64,android-x64`: build Android debug APKs.
+- `flutter build windows --release`: build the Windows GUI.
 
 ## Coding Style & Naming Conventions
 

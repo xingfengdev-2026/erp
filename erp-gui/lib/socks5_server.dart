@@ -5,6 +5,8 @@ import 'dart:typed_data';
 class Socks5Server {
   ServerSocket? _tcpServer;
   RawDatagramSocket? _udpRelay;
+  final _sockets = <Socket>{};
+  final _pipeSubs = <StreamSubscription<List<int>>>{};
   final _events = StreamController<String>.broadcast();
 
   Stream<String> get events => _events.stream;
@@ -29,10 +31,19 @@ class Socks5Server {
     _tcpServer = null;
     _udpRelay?.close();
     _udpRelay = null;
+    for (final sub in _pipeSubs.toList()) {
+      await sub.cancel();
+    }
+    _pipeSubs.clear();
+    for (final socket in _sockets.toList()) {
+      await socket.close();
+    }
+    _sockets.clear();
     _events.add('SOCKS5 stopped');
   }
 
   Future<void> _handleClient(Socket client) async {
+    _sockets.add(client);
     final reader = _SocketReader(client);
     try {
       final methods = await reader.readExact(2);
@@ -67,6 +78,9 @@ class Socks5Server {
       await client.close();
     } finally {
       await reader.cancel();
+      if (!reader.released) {
+        _sockets.remove(client);
+      }
     }
   }
 
@@ -82,6 +96,7 @@ class Socks5Server {
         port,
         timeout: const Duration(seconds: 10),
       );
+      _sockets.add(remote);
       _reply(client, 0x00);
       await client.flush();
       _events.add('CONNECT $host:$port');
@@ -199,17 +214,28 @@ class Socks5Server {
   void _pipeSocket(Socket source, Socket sink) {
     late StreamSubscription<List<int>> sub;
     sub = source.listen(
-      sink.add,
+      (chunk) {
+        try {
+          sink.add(chunk);
+        } catch (_) {}
+      },
       onError: (_) async {
         await sub.cancel();
+        _pipeSubs.remove(sub);
+        _sockets.remove(source);
+        _sockets.remove(sink);
         await sink.close();
       },
       onDone: () async {
         await sub.cancel();
+        _pipeSubs.remove(sub);
+        _sockets.remove(source);
+        _sockets.remove(sink);
         await sink.close();
       },
       cancelOnError: true,
     );
+    _pipeSubs.add(sub);
   }
 }
 
@@ -245,6 +271,8 @@ class _SocketReader {
   bool _closed = false;
   bool _released = false;
 
+  bool get released => _released;
+
   Future<List<int>> readExact(int length) {
     if (_buffer.length >= length) {
       final out = _buffer.sublist(0, length);
@@ -262,12 +290,18 @@ class _SocketReader {
 
   void forwardTo(Socket sink) {
     if (_buffer.isNotEmpty) {
-      sink.add(_buffer);
+      try {
+        sink.add(_buffer);
+      } catch (_) {}
       _buffer.clear();
     }
     _released = true;
     _sub
-      ..onData(sink.add)
+      ..onData((chunk) {
+        try {
+          sink.add(chunk);
+        } catch (_) {}
+      })
       ..onError((_) {
         sink.close();
       })

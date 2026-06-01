@@ -81,6 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -89,16 +90,32 @@ jobs:
         with:
           channel: stable
           cache: true
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$ANDROID_HOME/cmdline-tools/bin/sdkmanager"; fi
+          yes | "$SDKMANAGER" --install "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+      - name: Build bundled erp runtime
+        run: bash erp-gui/tool/build_android_runtime.sh
       - name: Install dependencies
         working-directory: erp-gui
         run: flutter pub get
       - name: Build Android APK
         working-directory: erp-gui
-        run: flutter build apk --debug
+        run: flutter build apk --debug --split-per-abi --target-platform android-arm64,android-x64
+      - name: Stage Android artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp erp-gui/build/app/outputs/flutter-apk/app-arm64-v8a-debug.apk dist/erp-gui-arm64-v8a-debug.apk
+          cp erp-gui/build/app/outputs/flutter-apk/app-x86_64-debug.apk dist/erp-gui-x86_64-debug.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: erp-gui-android-debug.apk
-          path: erp-gui/build/app/outputs/flutter-apk/app-debug.apk
+          name: erp-gui-android-debug-apks
+          path: dist/erp-gui-*-debug.apk
 
   flutter-windows:
     needs: flutter-check

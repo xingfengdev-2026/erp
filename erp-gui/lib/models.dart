@@ -2,11 +2,30 @@ import 'dart:convert';
 
 enum ErpRole { server, client }
 
+enum ErpProfileKind { socks5, forwarding }
+
 enum ErpTransport { raw, aes256Gcm, aes128Gcm }
 
 enum ErpProtocol { tcp, udp }
 
 enum ErpUdpMode { overTcp, direct }
+
+extension ErpProfileKindWire on ErpProfileKind {
+  String get wire => switch (this) {
+    ErpProfileKind.socks5 => 'socks5',
+    ErpProfileKind.forwarding => 'forwarding',
+  };
+
+  String get label => switch (this) {
+    ErpProfileKind.socks5 => 'SOCKS5 server',
+    ErpProfileKind.forwarding => 'Forwarding node',
+  };
+
+  static ErpProfileKind parse(String? value) => switch (value) {
+    'forwarding' => ErpProfileKind.forwarding,
+    _ => ErpProfileKind.socks5,
+  };
+}
 
 extension ErpTransportWire on ErpTransport {
   String get wire => switch (this) {
@@ -85,7 +104,7 @@ class ErpMapping {
     name: json['name'] as String? ?? 'mapping',
     protocol: ErpProtocolWire.parse(json['protocol'] as String? ?? 'tcp'),
     localAddr: json['local_addr'] as String? ?? '127.0.0.1:8080',
-    remotePort: json['remote_port'] as int? ?? 18080,
+    remotePort: _intValue(json['remote_port'], 18080),
     udpMode: json['udp_mode'] == null
         ? null
         : ErpUdpModeWire.parse(json['udp_mode'] as String),
@@ -95,6 +114,7 @@ class ErpMapping {
 class ErpProfile {
   const ErpProfile({
     required this.id,
+    required this.kind,
     required this.name,
     required this.serverAddr,
     required this.clientId,
@@ -105,6 +125,7 @@ class ErpProfile {
   });
 
   final String id;
+  final ErpProfileKind kind;
   final String name;
   final String serverAddr;
   final String clientId;
@@ -113,8 +134,16 @@ class ErpProfile {
   final List<ErpMapping> mappings;
   final int socks5Port;
 
+  ErpMapping get primaryMapping =>
+      mappings.isEmpty ? defaultMapping(kind, socks5Port) : mappings.first;
+
+  int get localPort => parsePort(primaryMapping.localAddr) ?? socks5Port;
+
+  bool get exposesSocks5 => kind == ErpProfileKind.socks5;
+
   ErpProfile copyWith({
     String? id,
+    ErpProfileKind? kind,
     String? name,
     String? serverAddr,
     String? clientId,
@@ -125,6 +154,7 @@ class ErpProfile {
   }) {
     return ErpProfile(
       id: id ?? this.id,
+      kind: kind ?? this.kind,
       name: name ?? this.name,
       serverAddr: serverAddr ?? this.serverAddr,
       clientId: clientId ?? this.clientId,
@@ -137,6 +167,7 @@ class ErpProfile {
 
   Map<String, dynamic> toJson() => {
     'id': id,
+    'kind': kind.wire,
     'name': name,
     'server_addr': serverAddr,
     'client_id': clientId,
@@ -148,25 +179,35 @@ class ErpProfile {
 
   String toPrettyJson() => const JsonEncoder.withIndent('  ').convert(toJson());
 
-  static ErpProfile fromJson(Map<String, dynamic> json) => ErpProfile(
-    id:
-        json['id'] as String? ??
-        DateTime.now().microsecondsSinceEpoch.toString(),
-    name: json['name'] as String? ?? 'ERP Client',
-    serverAddr: json['server_addr'] as String? ?? '127.0.0.1:7000',
-    clientId: json['client_id'] as String? ?? 'android',
-    token: json['token'] as String? ?? '',
-    transport: ErpTransportWire.parse(json['transport'] as String? ?? 'raw'),
-    socks5Port: json['socks5_port'] as int? ?? 1080,
-    mappings: (json['mappings'] as List<dynamic>? ?? const [])
+  static ErpProfile fromJson(Map<String, dynamic> json) {
+    final kind = ErpProfileKindWire.parse(json['kind'] as String?);
+    final socks5Port = _intValue(json['socks5_port'], 1080);
+    final mappings = (json['mappings'] as List<dynamic>? ?? const [])
         .map((e) => ErpMapping.fromJson(Map<String, dynamic>.from(e as Map)))
-        .toList(),
-  );
+        .toList();
+
+    return ErpProfile(
+      id:
+          json['id'] as String? ??
+          DateTime.now().microsecondsSinceEpoch.toString(),
+      kind: kind,
+      name: json['name'] as String? ?? 'ERP Client',
+      serverAddr: json['server_addr'] as String? ?? '127.0.0.1:7000',
+      clientId: json['client_id'] as String? ?? 'android',
+      token: json['token'] as String? ?? '',
+      transport: ErpTransportWire.parse(json['transport'] as String? ?? 'raw'),
+      socks5Port: socks5Port,
+      mappings: mappings.isEmpty
+          ? [defaultMapping(kind, socks5Port)]
+          : mappings,
+    );
+  }
 
   static ErpProfile starter() => ErpProfile(
     id: DateTime.now().microsecondsSinceEpoch.toString(),
+    kind: ErpProfileKind.socks5,
     name: 'Android SOCKS5',
-    serverAddr: '1.2.3.4:7000',
+    serverAddr: '127.0.0.1:7000',
     clientId: 'android-phone',
     token: 'change-me',
     transport: ErpTransport.raw,
@@ -180,4 +221,33 @@ class ErpProfile {
       ),
     ],
   );
+
+  static ErpMapping defaultMapping(ErpProfileKind kind, int socks5Port) {
+    if (kind == ErpProfileKind.socks5) {
+      return ErpMapping(
+        name: 'socks5',
+        protocol: ErpProtocol.tcp,
+        localAddr: '127.0.0.1:$socks5Port',
+        remotePort: 18080,
+      );
+    }
+    return const ErpMapping(
+      name: 'forward',
+      protocol: ErpProtocol.tcp,
+      localAddr: '127.0.0.1:8080',
+      remotePort: 18080,
+    );
+  }
+
+  static int? parsePort(String address) {
+    final index = address.lastIndexOf(':');
+    if (index < 0 || index == address.length - 1) return null;
+    return int.tryParse(address.substring(index + 1));
+  }
+}
+
+int _intValue(Object? value, int fallback) {
+  if (value is int) return value;
+  if (value is String) return int.tryParse(value) ?? fallback;
+  return fallback;
 }
