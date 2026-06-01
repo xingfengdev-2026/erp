@@ -73,3 +73,26 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/erp-gui-android.apk
+
+  gui-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Install dependencies
+        working-directory: erp-gui
+        run: flutter pub get
+      - name: Build Windows GUI
+        working-directory: erp-gui
+        run: flutter build windows --release
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path erp-gui\build\windows\x64\runner\Release\* -DestinationPath dist\erp-gui-windows-x64.zip -Force
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/erp-gui-windows-x64.zip

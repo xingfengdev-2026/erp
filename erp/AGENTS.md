@@ -24,7 +24,7 @@ Use Cargo commands once the Rust project is initialized:
 - `cargo clippy -- -D warnings`: run lint checks.
 - `cargo build --release`: build an optimized binary.
 - `.\scripts\build-local.ps1`: build local Windows and Linux compatibility artifacts into `dist/`.
-- `.\scripts\deploy-test-remote.ps1`: upload the local Linux artifact to `user@example.com` and run `erp --version`.
+- `.\scripts\deploy-test-remote.ps1 -Remote user@example.com`: upload the local Linux artifact to a test host and run `erp --version`.
 
 ## Coding Style & Naming Conventions
 

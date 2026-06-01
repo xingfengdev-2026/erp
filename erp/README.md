@@ -48,4 +48,4 @@ cargo build --release
 
 GitHub Actions run format, lint, and tests on pushes and pull requests. Tags like `v0.1.0` trigger release builds for Windows, Linux musl, and macOS x64.
 
-Use `scripts/build-local.ps1` on Windows to build local Windows and Linux artifacts. The Linux artifact uses `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` for compatibility with older servers such as Ubuntu 22. Use `scripts/deploy-test-remote.ps1` to upload that Linux binary to `user@example.com` and run `erp --version`.
+Use `scripts/build-local.ps1` on Windows to build local Windows and Linux artifacts. The Linux artifact uses `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` for compatibility with older servers such as Ubuntu 22. Use `scripts/deploy-test-remote.ps1 -Remote user@example.com` to upload that Linux binary to a test host and run `erp --version`.

@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  rust:
+  rust-check:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -22,7 +22,43 @@ jobs:
       - name: Run tests
         run: cargo test
 
-  flutter:
+  rust-build:
+    needs: rust-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: erp
+            artifact: erp-x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: erp.exe
+            artifact: erp-x86_64-pc-windows-msvc.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build CLI binary
+        working-directory: erp
+        run: cargo build --release --target ${{ matrix.target }} --bin erp
+      - name: Stage CLI artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "erp/target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  flutter-check:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -39,3 +75,52 @@ jobs:
         run: flutter analyze
       - name: Test
         run: flutter test
+
+  flutter-android:
+    needs: flutter-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Install dependencies
+        working-directory: erp-gui
+        run: flutter pub get
+      - name: Build Android APK
+        working-directory: erp-gui
+        run: flutter build apk --debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erp-gui-android-debug.apk
+          path: erp-gui/build/app/outputs/flutter-apk/app-debug.apk
+
+  flutter-windows:
+    needs: flutter-check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Install dependencies
+        working-directory: erp-gui
+        run: flutter pub get
+      - name: Build Windows GUI
+        working-directory: erp-gui
+        run: flutter build windows --release
+      - name: Package Windows GUI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path erp-gui\build\windows\x64\runner\Release\* -DestinationPath dist\erp-gui-windows-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erp-gui-windows-x64.zip
+          path: dist/erp-gui-windows-x64.zip

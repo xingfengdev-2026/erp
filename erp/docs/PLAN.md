@@ -49,7 +49,7 @@ Build `erp` as a single Rust CLI binary for easy reverse proxying. It supports `
 - Add release workflow triggered by tags like `v0.1.0`.
 - Publish x64 binaries for Windows, Linux musl, and macOS.
 - Use local `scripts/build-local.ps1` for Windows and Linux glibc 2.17 artifacts.
-- Use `scripts/deploy-test-remote.ps1` to upload and verify the Linux artifact on `user@example.com`.
+- Use `scripts/deploy-test-remote.ps1 -Remote user@example.com` to upload and verify the Linux artifact on a test host.
 
 ## Assumptions
 
