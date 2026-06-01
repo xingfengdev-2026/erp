@@ -57,6 +57,7 @@ fn spawn_erp(args: &[&str]) -> Child {
 
 fn write_configs(
     dir: &TempDir,
+    transport: &str,
     control_port: u16,
     local_port: u16,
     remote_port: u16,
@@ -69,7 +70,7 @@ fn write_configs(
             r#"
 role = "server"
 token = "secret"
-transport = "raw"
+transport = "{transport}"
 
 [server]
 bind_addr = "127.0.0.1"
@@ -84,7 +85,7 @@ control_port = {control_port}
             r#"
 role = "client"
 token = "secret"
-transport = "raw"
+transport = "{transport}"
 
 [client]
 server_addr = "127.0.0.1:{control_port}"
@@ -106,13 +107,13 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-#[tokio::test]
-async fn raw_tcp_forwarding_round_trips_data() {
+async fn assert_tcp_forwarding(transport: &str) {
     let control_port = free_port();
     let local_port = free_port();
     let remote_port = free_port();
     let dir = TempDir::new().unwrap();
-    let (server_config, client_config) = write_configs(&dir, control_port, local_port, remote_port);
+    let (server_config, client_config) =
+        write_configs(&dir, transport, control_port, local_port, remote_port);
 
     tokio::spawn(start_echo(format!("127.0.0.1:{local_port}")));
     wait_for_tcp(&format!("127.0.0.1:{local_port}")).await;
@@ -132,5 +133,53 @@ async fn raw_tcp_forwarding_round_trips_data() {
     assert_eq!(&buf, b"hello");
 
     let _ = client.kill().await;
+    let _ = server.kill().await;
+}
+
+#[tokio::test]
+async fn raw_tcp_forwarding_round_trips_data() {
+    assert_tcp_forwarding("raw").await;
+}
+
+#[tokio::test]
+async fn aes_tcp_forwarding_round_trips_data() {
+    assert_tcp_forwarding("aes-256-gcm").await;
+}
+
+#[tokio::test]
+async fn remote_port_is_reusable_after_client_disconnect() {
+    let control_port = free_port();
+    let local_port = free_port();
+    let remote_port = free_port();
+    let dir = TempDir::new().unwrap();
+    let (server_config, client_config) =
+        write_configs(&dir, "raw", control_port, local_port, remote_port);
+
+    tokio::spawn(start_echo(format!("127.0.0.1:{local_port}")));
+    wait_for_tcp(&format!("127.0.0.1:{local_port}")).await;
+
+    let mut server = spawn_erp(&["server", "--config", &server_config]);
+    wait_for_tcp(&format!("127.0.0.1:{control_port}")).await;
+
+    let mut first_client = spawn_erp(&["client", "--config", &client_config]);
+    wait_for_tcp(&format!("127.0.0.1:{remote_port}")).await;
+    let _ = first_client.kill().await;
+    sleep(Duration::from_millis(100)).await;
+
+    let mut second_client = spawn_erp(&["client", "--config", &client_config]);
+    wait_for_tcp(&format!("127.0.0.1:{remote_port}")).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{remote_port}"))
+        .await
+        .unwrap();
+    stream.write_all(b"again").await.unwrap();
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"again");
+
+    let _ = second_client.kill().await;
     let _ = server.kill().await;
 }

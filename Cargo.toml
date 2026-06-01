@@ -1,22 +1,21 @@
 [package]
 name = "erp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 bincode = "1"
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
+hkdf = "0.12"
 hmac = "0.12"
 rand = "0.8"
-rustls = "0.23"
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = "0.26"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

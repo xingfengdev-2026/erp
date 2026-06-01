@@ -1,10 +1,8 @@
 role = "server"
 token = "change-me"
-transport = "tls"
+transport = "aes-256-gcm"
 
 [server]
 bind_addr = "0.0.0.0"
 control_port = 7000
-tls_cert_path = "server.crt"
-tls_key_path = "server.key"
 

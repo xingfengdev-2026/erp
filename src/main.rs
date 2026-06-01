@@ -1,19 +1,18 @@
+use aes_gcm::{
+    Aes128Gcm, Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
+use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{RngCore, rngs::OsRng};
-use rustls::{
-    ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
-};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet},
     env,
-    fs::File,
-    io::BufReader,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -21,17 +20,17 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, mpsc, oneshot},
     time::{Duration, timeout},
 };
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
 type BoxedStream = Box<dyn TunnelStream>;
 const DIRECT_AUTH_WINDOW_SECS: u64 = 300;
+const AES_NONCE_LEN: usize = 12;
 
 trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -67,6 +66,11 @@ enum Role {
 #[serde(rename_all = "lowercase")]
 enum Transport {
     Raw,
+    #[serde(rename = "aes-128-gcm")]
+    Aes128Gcm,
+    #[serde(rename = "aes-256-gcm")]
+    Aes256Gcm,
+    #[serde(alias = "tls")]
     Tls,
 }
 
@@ -132,6 +136,7 @@ enum Frame {
     AuthProof {
         client_id: String,
         timestamp: u64,
+        client_nonce: Vec<u8>,
         proof: Vec<u8>,
     },
     AuthOk,
@@ -163,12 +168,16 @@ enum Frame {
     DataStart {
         conn_id: u64,
     },
+    Data {
+        payload: Vec<u8>,
+    },
+    DataEnd,
     Error {
         message: String,
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum UdpDatagram {
     Hello {
         client_id: String,
@@ -185,6 +194,119 @@ enum UdpDatagram {
         nonce: Vec<u8>,
         proof: Vec<u8>,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum DirectUdpFrame {
+    Plain(UdpDatagram),
+    Encrypted { nonce: Vec<u8>, ciphertext: Vec<u8> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    ClientToServer,
+    ServerToClient,
+}
+
+#[derive(Clone)]
+enum SessionCrypto {
+    Raw,
+    Aes128(Box<Aes128Gcm>),
+    Aes256(Box<Aes256Gcm>),
+}
+
+struct FrameReader<R> {
+    reader: R,
+    crypto: SessionCrypto,
+    direction: Direction,
+    counter: u64,
+}
+
+struct FrameWriter<W> {
+    writer: W,
+    crypto: SessionCrypto,
+    direction: Direction,
+    counter: u64,
+}
+
+impl<R> FrameReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn new(reader: R, crypto: SessionCrypto, direction: Direction, counter: u64) -> Self {
+        Self {
+            reader,
+            crypto,
+            direction,
+            counter,
+        }
+    }
+
+    async fn read_frame(&mut self) -> Result<Frame> {
+        let payload = read_payload(&mut self.reader).await?;
+        let payload = decrypt_payload(&self.crypto, self.direction, self.counter, &payload)?;
+        self.counter += 1;
+        Ok(bincode::deserialize(&payload)?)
+    }
+}
+
+impl<W> FrameWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn new(writer: W, crypto: SessionCrypto, direction: Direction, counter: u64) -> Self {
+        Self {
+            writer,
+            crypto,
+            direction,
+            counter,
+        }
+    }
+
+    async fn write_frame(&mut self, frame: &Frame) -> Result<()> {
+        let payload = bincode::serialize(frame)?;
+        let payload = encrypt_payload(&self.crypto, self.direction, self.counter, &payload)?;
+        self.counter += 1;
+        write_payload(&mut self.writer, &payload).await
+    }
+}
+
+async fn read_session_frame<R>(
+    reader: &mut R,
+    crypto: &SessionCrypto,
+    direction: Direction,
+    counter: &mut u64,
+) -> Result<Frame>
+where
+    R: AsyncRead + Unpin,
+{
+    let payload = read_payload(reader).await?;
+    let payload = decrypt_payload(crypto, direction, *counter, &payload)?;
+    *counter += 1;
+    Ok(bincode::deserialize(&payload)?)
+}
+
+async fn write_session_frame<W>(
+    writer: &mut W,
+    crypto: &SessionCrypto,
+    direction: Direction,
+    counter: &mut u64,
+    frame: &Frame,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = bincode::serialize(frame)?;
+    let payload = encrypt_payload(crypto, direction, *counter, &payload)?;
+    *counter += 1;
+    write_payload(writer, &payload).await
+}
+
+struct DataSession {
+    stream: BoxedStream,
+    crypto: SessionCrypto,
+    read_counter: u64,
+    write_counter: u64,
 }
 
 #[tokio::main]
@@ -226,13 +348,13 @@ fn role_of(command: &Command) -> &Role {
 fn prompt_role() -> Result<Command> {
     let choice = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select erp role")
-        .items(&["server", "client"])
+        .items(&["client", "server"])
         .default(0)
         .interact()?;
     Ok(if choice == 0 {
-        Command::Server { config: None }
-    } else {
         Command::Client { config: None }
+    } else {
+        Command::Server { config: None }
     })
 }
 
@@ -296,13 +418,13 @@ fn create_config_interactively(role: Role, path: &Path) -> Result<()> {
         .interact()?;
     let transport_index = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Transport")
-        .items(&["tls", "raw"])
+        .items(&["raw", "aes-256-gcm", "aes-128-gcm"])
         .default(0)
         .interact()?;
-    let transport = if transport_index == 0 {
-        Transport::Tls
-    } else {
-        Transport::Raw
+    let transport = match transport_index {
+        0 => Transport::Raw,
+        1 => Transport::Aes256Gcm,
+        _ => Transport::Aes128Gcm,
     };
 
     let config = match role {
@@ -315,17 +437,6 @@ fn create_config_interactively(role: Role, path: &Path) -> Result<()> {
                 .with_prompt("Control port")
                 .default(7000)
                 .interact_text()?;
-            let (tls_cert_path, tls_key_path) = if transport == Transport::Tls {
-                let cert: String = Input::with_theme(&ColorfulTheme::default())
-                    .with_prompt("TLS certificate PEM path")
-                    .interact_text()?;
-                let key: String = Input::with_theme(&ColorfulTheme::default())
-                    .with_prompt("TLS private key PEM path")
-                    .interact_text()?;
-                (Some(PathBuf::from(cert)), Some(PathBuf::from(key)))
-            } else {
-                (None, None)
-            };
             Config {
                 role,
                 token,
@@ -333,8 +444,8 @@ fn create_config_interactively(role: Role, path: &Path) -> Result<()> {
                 server: Some(ServerConfig {
                     bind_addr,
                     control_port,
-                    tls_cert_path,
-                    tls_key_path,
+                    tls_cert_path: None,
+                    tls_key_path: None,
                 }),
                 client: None,
             }
@@ -348,26 +459,17 @@ fn create_config_interactively(role: Role, path: &Path) -> Result<()> {
                 .with_prompt("Client id")
                 .default("default".into())
                 .interact_text()?;
-            let (tls_server_name, tls_ca_cert_path) = if transport == Transport::Tls {
-                let server_name: String = Input::with_theme(&ColorfulTheme::default())
-                    .with_prompt("TLS server name")
-                    .default(default_tls_server_name(&server_addr))
-                    .interact_text()?;
-                let ca_cert: String = Input::with_theme(&ColorfulTheme::default())
-                    .with_prompt("TLS CA certificate PEM path")
-                    .interact_text()?;
-                (Some(server_name), Some(PathBuf::from(ca_cert)))
-            } else {
-                (None, None)
-            };
-            let local_addr: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Local service address")
-                .default("127.0.0.1:8080".into())
-                .interact_text()?;
-            let remote_port: u16 = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Server remote port")
-                .default(18080)
-                .interact_text()?;
+            let mut mappings = Vec::new();
+            loop {
+                mappings.push(prompt_mapping_interactively(&client_id, mappings.len())?);
+                if !Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Add another mapping")
+                    .default(false)
+                    .interact()?
+                {
+                    break;
+                }
+            }
             Config {
                 role,
                 token,
@@ -376,15 +478,9 @@ fn create_config_interactively(role: Role, path: &Path) -> Result<()> {
                 client: Some(ClientConfig {
                     server_addr,
                     client_id,
-                    tls_server_name,
-                    tls_ca_cert_path,
-                    mappings: vec![MappingConfig {
-                        name: "default".into(),
-                        protocol: Protocol::Tcp,
-                        local_addr,
-                        remote_port,
-                        udp_mode: None,
-                    }],
+                    tls_server_name: None,
+                    tls_ca_cert_path: None,
+                    mappings,
                 }),
             }
         }
@@ -395,106 +491,93 @@ fn create_config_interactively(role: Role, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn prompt_mapping_interactively(client_id: &str, index: usize) -> Result<MappingConfig> {
+    let default_name = if index == 0 {
+        client_id.to_string()
+    } else {
+        format!("{client_id}-{index}")
+    };
+    let name: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Mapping name")
+        .default(default_name)
+        .interact_text()?;
+    let protocol_index = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Mapping protocol")
+        .items(&["tcp", "udp"])
+        .default(0)
+        .interact()?;
+    let protocol = if protocol_index == 0 {
+        Protocol::Tcp
+    } else {
+        Protocol::Udp
+    };
+    let local_addr: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Local service address")
+        .default("127.0.0.1:8080".into())
+        .interact_text()?;
+    let remote_port: u16 = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Server remote port")
+        .default(18080)
+        .interact_text()?;
+    let udp_mode = if protocol == Protocol::Udp {
+        let mode_index = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("UDP mode")
+            .items(&["udp over tcp", "direct udp"])
+            .default(0)
+            .interact()?;
+        Some(if mode_index == 0 {
+            UdpMode::OverTcp
+        } else {
+            UdpMode::Direct
+        })
+    } else {
+        None
+    };
+    Ok(MappingConfig {
+        name,
+        protocol,
+        local_addr,
+        remote_port,
+        udp_mode,
+    })
+}
+
 fn load_config(path: &Path) -> Result<Config> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     toml::from_str(&content).with_context(|| format!("failed to parse config {}", path.display()))
 }
 
-fn build_server_tunnel(transport: Transport, server: &ServerConfig) -> Result<ServerTunnel> {
+fn build_server_tunnel(transport: Transport, _server: &ServerConfig) -> Result<ServerTunnel> {
     match transport {
-        Transport::Raw => Ok(ServerTunnel::Raw),
+        Transport::Raw | Transport::Aes128Gcm | Transport::Aes256Gcm => {
+            Ok(ServerTunnel { transport })
+        }
         Transport::Tls => {
-            let cert_path = server
-                .tls_cert_path
-                .as_ref()
-                .context("tls_cert_path is required when transport = \"tls\"")?;
-            let key_path = server
-                .tls_key_path
-                .as_ref()
-                .context("tls_key_path is required when transport = \"tls\"")?;
-            let certs = load_certs(cert_path)?;
-            let key = load_private_key(key_path)?;
-            let config = RustlsServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)?;
-            Ok(ServerTunnel::Tls(TlsAcceptor::from(Arc::new(config))))
+            bail!("transport = \"tls\" is deprecated; use \"aes-256-gcm\" or \"raw\"")
         }
     }
 }
 
-fn build_client_tunnel(transport: Transport, client: &ClientConfig) -> Result<ClientTunnel> {
+fn build_client_tunnel(transport: Transport, _client: &ClientConfig) -> Result<ClientTunnel> {
     match transport {
-        Transport::Raw => Ok(ClientTunnel::Raw),
+        Transport::Raw | Transport::Aes128Gcm | Transport::Aes256Gcm => {
+            Ok(ClientTunnel { transport })
+        }
         Transport::Tls => {
-            let ca_path = client
-                .tls_ca_cert_path
-                .as_ref()
-                .context("tls_ca_cert_path is required when transport = \"tls\"")?;
-            let mut roots = RootCertStore::empty();
-            for cert in load_certs(ca_path)? {
-                roots.add(cert)?;
-            }
-            let config = RustlsClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            Ok(ClientTunnel::Tls {
-                connector: TlsConnector::from(Arc::new(config)),
-                server_name: client
-                    .tls_server_name
-                    .clone()
-                    .unwrap_or_else(|| default_tls_server_name(&client.server_addr)),
-            })
+            bail!("transport = \"tls\" is deprecated; use \"aes-256-gcm\" or \"raw\"")
         }
     }
 }
 
 async fn accept_tunnel(stream: TcpStream, tunnel: &ServerTunnel) -> Result<BoxedStream> {
-    match tunnel {
-        ServerTunnel::Raw => Ok(Box::new(stream)),
-        ServerTunnel::Tls(acceptor) => Ok(Box::new(acceptor.accept(stream).await?)),
-    }
+    let _ = tunnel;
+    Ok(Box::new(stream))
 }
 
 async fn connect_tunnel(addr: &str, tunnel: &ClientTunnel) -> Result<BoxedStream> {
-    let stream = TcpStream::connect(addr).await?;
-    match tunnel {
-        ClientTunnel::Raw => Ok(Box::new(stream)),
-        ClientTunnel::Tls {
-            connector,
-            server_name,
-        } => {
-            let server_name = ServerName::try_from(server_name.clone())
-                .map_err(|_| anyhow!("invalid tls_server_name {}", server_name))?;
-            Ok(Box::new(connector.connect(server_name, stream).await?))
-        }
-    }
-}
-
-fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
-    );
-    let certs = rustls_pemfile::certs(&mut reader).collect::<std::io::Result<Vec<_>>>()?;
-    if certs.is_empty() {
-        bail!("no certificates found in {}", path.display());
-    }
-    Ok(certs)
-}
-
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
-    );
-    rustls_pemfile::private_key(&mut reader)?
-        .with_context(|| format!("no private key found in {}", path.display()))
-}
-
-fn default_tls_server_name(addr: &str) -> String {
-    addr.rsplit_once(':')
-        .map(|(host, _)| host.trim_matches(|c| c == '[' || c == ']').to_string())
-        .filter(|host| !host.is_empty())
-        .unwrap_or_else(|| "localhost".to_string())
+    let _ = tunnel;
+    Ok(Box::new(TcpStream::connect(addr).await?))
 }
 
 async fn run_server(config: Config) -> Result<()> {
@@ -505,7 +588,12 @@ async fn run_server(config: Config) -> Result<()> {
     let state = Arc::new(ServerState::default());
     let direct_socket = Arc::new(UdpSocket::bind(&control_addr).await?);
     *state.direct_socket.lock().await = Some(direct_socket.clone());
-    spawn_direct_udp_server(direct_socket, state.clone(), config.token.clone());
+    spawn_direct_udp_server(
+        direct_socket,
+        state.clone(),
+        config.token.clone(),
+        config.transport,
+    );
     info!("server listening on {}", control_addr);
 
     loop {
@@ -516,7 +604,7 @@ async fn run_server(config: Config) -> Result<()> {
         tokio::spawn(async move {
             let result = async {
                 let stream = accept_tunnel(stream, &tunnel).await?;
-                handle_server_conn(stream, state, token).await
+                handle_server_conn(stream, state, token, tunnel.transport).await
             }
             .await;
             if let Err(err) = result {
@@ -527,42 +615,57 @@ async fn run_server(config: Config) -> Result<()> {
 }
 
 #[derive(Clone)]
-enum ServerTunnel {
-    Raw,
-    Tls(TlsAcceptor),
+struct ServerTunnel {
+    transport: Transport,
 }
 
 #[derive(Clone)]
-enum ClientTunnel {
-    Raw,
-    Tls {
-        connector: TlsConnector,
-        server_name: String,
-    },
+struct ClientTunnel {
+    transport: Transport,
 }
 
 #[derive(Default)]
 struct ServerState {
     mappings: Mutex<HashSet<u16>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<BoxedStream>>>,
+    pending: Mutex<HashMap<u64, PendingData>>,
     udp_sockets: Mutex<HashMap<u16, Arc<UdpSocket>>>,
     direct_routes: Mutex<HashMap<u16, SocketAddr>>,
     direct_socket: Mutex<Option<Arc<UdpSocket>>>,
+}
+
+struct PendingData {
+    remote_port: u16,
+    sender: oneshot::Sender<DataSession>,
 }
 
 async fn handle_server_conn(
     mut stream: BoxedStream,
     state: Arc<ServerState>,
     token: String,
+    transport: Transport,
 ) -> Result<()> {
-    authenticate_server_side(&mut stream, &token).await?;
-    let frame = read_frame(&mut stream).await?;
+    let crypto = authenticate_server_side(&mut stream, &token, transport).await?;
+    let mut recv_counter = 0;
+    let frame = read_session_frame(
+        &mut stream,
+        &crypto,
+        Direction::ClientToServer,
+        &mut recv_counter,
+    )
+    .await?;
     match frame {
-        Frame::Register { mappings } => handle_registration(stream, state, token, mappings).await,
+        Frame::Register { mappings } => {
+            handle_registration(stream, state, token, mappings, crypto, recv_counter).await
+        }
         Frame::DataStart { conn_id } => {
             let sender = state.pending.lock().await.remove(&conn_id);
-            if let Some(sender) = sender {
-                let _ = sender.send(stream);
+            if let Some(pending) = sender {
+                let _ = pending.sender.send(DataSession {
+                    stream,
+                    crypto,
+                    read_counter: recv_counter,
+                    write_counter: 0,
+                });
                 Ok(())
             } else {
                 bail!("unknown data connection {}", conn_id)
@@ -577,24 +680,36 @@ async fn handle_registration(
     state: Arc<ServerState>,
     token: String,
     mappings: Vec<MappingConfig>,
+    crypto: SessionCrypto,
+    read_counter: u64,
 ) -> Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader_half, writer_half) = tokio::io::split(stream);
+    let mut reader = FrameReader::new(
+        reader_half,
+        crypto.clone(),
+        Direction::ClientToServer,
+        read_counter,
+    );
+    let mut writer = FrameWriter::new(writer_half, crypto.clone(), Direction::ServerToClient, 0);
     let (tx, mut rx) = mpsc::channel::<Frame>(128);
+    let mut listener_tasks = Vec::new();
+    let owned_ports = mappings
+        .iter()
+        .map(|mapping| mapping.remote_port)
+        .collect::<Vec<_>>();
 
     {
         let mut registered = state.mappings.lock().await;
         for mapping in &mappings {
             if registered.contains(&mapping.remote_port) {
-                write_frame(
-                    &mut writer,
-                    &Frame::RegisterFailed {
+                writer
+                    .write_frame(&Frame::RegisterFailed {
                         message: format!(
                             "remote port {} is already registered",
                             mapping.remote_port
                         ),
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 bail!("duplicate remote port {}", mapping.remote_port);
             }
         }
@@ -603,34 +718,46 @@ async fn handle_registration(
         }
     }
 
-    write_frame(&mut writer, &Frame::RegisterOk).await?;
+    writer.write_frame(&Frame::RegisterOk).await?;
     for mapping in mappings {
         match mapping.protocol {
-            Protocol::Tcp => {
-                spawn_tcp_listener(mapping.remote_port, state.clone(), tx.clone()).await?
-            }
-            Protocol::Udp => {
-                spawn_udp_listener(mapping, state.clone(), tx.clone(), token.clone()).await?
-            }
+            Protocol::Tcp => listener_tasks
+                .push(spawn_tcp_listener(mapping.remote_port, state.clone(), tx.clone()).await?),
+            Protocol::Udp => listener_tasks.push(
+                spawn_udp_listener(
+                    mapping,
+                    state.clone(),
+                    tx.clone(),
+                    token.clone(),
+                    crypto_transport(&crypto),
+                )
+                .await?,
+            ),
         }
     }
 
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            if write_frame(&mut writer, &frame).await.is_err() {
+            if writer.write_frame(&frame).await.is_err() {
                 break;
             }
         }
     });
-    let reader_task = tokio::spawn(async move {
+    let reader_state = state.clone();
+    let mut reader_task = tokio::spawn(async move {
         loop {
-            match read_frame(&mut reader).await {
+            match reader.read_frame().await {
                 Ok(Frame::UdpResponse {
                     remote_port,
                     payload,
                     peer,
                 }) => {
-                    let socket = state.udp_sockets.lock().await.get(&remote_port).cloned();
+                    let socket = reader_state
+                        .udp_sockets
+                        .lock()
+                        .await
+                        .get(&remote_port)
+                        .cloned();
                     if let Some(socket) = socket {
                         let _ = socket.send_to(&payload, peer).await;
                     }
@@ -641,20 +768,56 @@ async fn handle_registration(
         }
     });
 
-    let _ = tokio::join!(writer_task, reader_task);
+    tokio::select! {
+        _ = &mut writer_task => {
+            reader_task.abort();
+        }
+        _ = &mut reader_task => {
+            writer_task.abort();
+        }
+    }
+
+    for task in listener_tasks {
+        task.abort();
+    }
+    cleanup_client_ports(&state, &owned_ports).await;
     Ok(())
+}
+
+async fn cleanup_client_ports(state: &ServerState, ports: &[u16]) {
+    let owned = ports.iter().copied().collect::<HashSet<_>>();
+    state
+        .mappings
+        .lock()
+        .await
+        .retain(|port| !owned.contains(port));
+    state
+        .udp_sockets
+        .lock()
+        .await
+        .retain(|port, _| !owned.contains(port));
+    state
+        .direct_routes
+        .lock()
+        .await
+        .retain(|port, _| !owned.contains(port));
+    state
+        .pending
+        .lock()
+        .await
+        .retain(|_, pending| !owned.contains(&pending.remote_port));
 }
 
 async fn spawn_tcp_listener(
     remote_port: u16,
     state: Arc<ServerState>,
     tx: mpsc::Sender<Frame>,
-) -> Result<()> {
+) -> Result<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(("0.0.0.0", remote_port)).await?;
     info!("tcp remote port {} listening", remote_port);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
-            let Ok((mut inbound, _)) = listener.accept().await else {
+            let Ok((inbound, _)) = listener.accept().await else {
                 continue;
             };
             let state = state.clone();
@@ -662,7 +825,13 @@ async fn spawn_tcp_listener(
             tokio::spawn(async move {
                 let conn_id = next_id();
                 let (sender, receiver) = oneshot::channel();
-                state.pending.lock().await.insert(conn_id, sender);
+                state.pending.lock().await.insert(
+                    conn_id,
+                    PendingData {
+                        remote_port,
+                        sender,
+                    },
+                );
                 if tx
                     .send(Frame::OpenTcp {
                         conn_id,
@@ -675,8 +844,14 @@ async fn spawn_tcp_listener(
                     return;
                 }
                 match timeout(Duration::from_secs(10), receiver).await {
-                    Ok(Ok(mut outbound)) => {
-                        let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                    Ok(Ok(outbound)) => {
+                        let _ = relay_tcp_stream(
+                            inbound,
+                            outbound,
+                            Direction::ClientToServer,
+                            Direction::ServerToClient,
+                        )
+                        .await;
                     }
                     _ => {
                         let _ = state.pending.lock().await.remove(&conn_id);
@@ -685,7 +860,7 @@ async fn spawn_tcp_listener(
             });
         }
     });
-    Ok(())
+    Ok(task)
 }
 
 async fn spawn_udp_listener(
@@ -693,7 +868,8 @@ async fn spawn_udp_listener(
     state: Arc<ServerState>,
     tx: mpsc::Sender<Frame>,
     token: String,
-) -> Result<()> {
+    transport: Transport,
+) -> Result<tokio::task::JoinHandle<()>> {
     let remote_port = mapping.remote_port;
     let udp_mode = mapping.udp_mode.unwrap_or(UdpMode::OverTcp);
     let socket = Arc::new(UdpSocket::bind(("0.0.0.0", remote_port)).await?);
@@ -703,7 +879,7 @@ async fn spawn_udp_listener(
         .await
         .insert(remote_port, socket.clone());
     info!("udp remote port {} listening", remote_port);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
@@ -726,7 +902,8 @@ async fn spawn_udp_listener(
                     let route = state.direct_routes.lock().await.get(&remote_port).cloned();
                     let direct_socket = state.direct_socket.lock().await.clone();
                     if let (Some(route), Some(direct_socket)) = (route, direct_socket)
-                        && let Ok(packet) = make_direct_packet(&token, remote_port, peer, payload)
+                        && let Ok(packet) =
+                            make_direct_packet(&token, transport, remote_port, peer, payload)
                     {
                         let _ = direct_socket.send_to(&packet, route).await;
                     }
@@ -734,17 +911,22 @@ async fn spawn_udp_listener(
             }
         }
     });
-    Ok(())
+    Ok(task)
 }
 
-fn spawn_direct_udp_server(socket: Arc<UdpSocket>, state: Arc<ServerState>, token: String) {
+fn spawn_direct_udp_server(
+    socket: Arc<UdpSocket>,
+    state: Arc<ServerState>,
+    token: String,
+    transport: Transport,
+) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             let Ok((n, addr)) = socket.recv_from(&mut buf).await else {
                 continue;
             };
-            match bincode::deserialize::<UdpDatagram>(&buf[..n]) {
+            match decode_direct_frame(&token, transport, &buf[..n]) {
                 Ok(UdpDatagram::Hello {
                     client_id,
                     remote_port,
@@ -797,7 +979,11 @@ fn spawn_direct_udp_server(socket: Arc<UdpSocket>, state: Arc<ServerState>, toke
     });
 }
 
-async fn spawn_direct_udp_client(client: ClientConfig, token: String) -> Result<()> {
+async fn spawn_direct_udp_client(
+    client: ClientConfig,
+    token: String,
+    transport: Transport,
+) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let direct_mappings = client
         .mappings
@@ -807,7 +993,7 @@ async fn spawn_direct_udp_client(client: ClientConfig, token: String) -> Result<
         .collect::<Vec<_>>();
 
     for mapping in &direct_mappings {
-        let hello = make_direct_hello(&token, &client.client_id, mapping.remote_port)?;
+        let hello = make_direct_hello(&token, transport, &client.client_id, mapping.remote_port)?;
         socket.send_to(&hello, &client.server_addr).await?;
     }
 
@@ -824,7 +1010,7 @@ async fn spawn_direct_udp_client(client: ClientConfig, token: String) -> Result<
                 timestamp,
                 nonce,
                 proof,
-            }) = bincode::deserialize::<UdpDatagram>(&buf[..n])
+            }) = decode_direct_frame(&token, transport, &buf[..n])
             else {
                 continue;
             };
@@ -844,7 +1030,9 @@ async fn spawn_direct_udp_client(client: ClientConfig, token: String) -> Result<
 
             match forward_udp_once(client.clone(), remote_port, payload).await {
                 Ok(Some(payload)) => {
-                    if let Ok(packet) = make_direct_packet(&token, remote_port, peer, payload) {
+                    if let Ok(packet) =
+                        make_direct_packet(&token, transport, remote_port, peer, payload)
+                    {
                         let _ = socket.send_to(&packet, &client.server_addr).await;
                     }
                 }
@@ -861,15 +1049,33 @@ async fn run_client(config: Config) -> Result<()> {
     let client = config.client.clone().context("missing client config")?;
     let tunnel = build_client_tunnel(config.transport, &client)?;
     let mut stream = connect_tunnel(&client.server_addr, &tunnel).await?;
-    authenticate_client_side(&mut stream, &config.token, &client.client_id).await?;
-    write_frame(
+    let crypto = authenticate_client_side(
         &mut stream,
+        &config.token,
+        &client.client_id,
+        tunnel.transport,
+    )
+    .await?;
+    let mut send_counter = 0;
+    let mut recv_counter = 0;
+    write_session_frame(
+        &mut stream,
+        &crypto,
+        Direction::ClientToServer,
+        &mut send_counter,
         &Frame::Register {
             mappings: client.mappings.clone(),
         },
     )
     .await?;
-    match read_frame(&mut stream).await? {
+    match read_session_frame(
+        &mut stream,
+        &crypto,
+        Direction::ServerToClient,
+        &mut recv_counter,
+    )
+    .await?
+    {
         Frame::RegisterOk => info!("client registered"),
         Frame::RegisterFailed { message } => bail!("registration failed: {}", message),
         other => bail!("unexpected register response: {:?}", other),
@@ -879,20 +1085,27 @@ async fn run_client(config: Config) -> Result<()> {
         .iter()
         .any(|mapping| mapping.udp_mode == Some(UdpMode::Direct))
     {
-        spawn_direct_udp_client(client.clone(), config.token.clone()).await?;
+        spawn_direct_udp_client(client.clone(), config.token.clone(), config.transport).await?;
     }
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader, writer) = tokio::io::split(stream);
+    let mut reader = FrameReader::new(
+        reader,
+        crypto.clone(),
+        Direction::ServerToClient,
+        recv_counter,
+    );
+    let mut writer = FrameWriter::new(writer, crypto, Direction::ClientToServer, send_counter);
     let (tx, mut rx) = mpsc::channel::<Frame>(128);
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            if write_frame(&mut writer, &frame).await.is_err() {
+            if writer.write_frame(&frame).await.is_err() {
                 break;
             }
         }
     });
 
-    while let Ok(frame) = read_frame(&mut reader).await {
+    while let Ok(frame) = reader.read_frame().await {
         match frame {
             Frame::OpenTcp {
                 conn_id,
@@ -953,11 +1166,92 @@ async fn open_tcp_data(
         .find(|mapping| mapping.remote_port == remote_port && mapping.protocol == Protocol::Tcp)
         .context("missing tcp mapping")?;
     let mut server_stream = connect_tunnel(&client.server_addr, &tunnel).await?;
-    authenticate_client_side(&mut server_stream, &token, &client.client_id).await?;
-    write_frame(&mut server_stream, &Frame::DataStart { conn_id }).await?;
-    let mut local = TcpStream::connect(&mapping.local_addr).await?;
-    copy_bidirectional(&mut server_stream, &mut local).await?;
+    let crypto = authenticate_client_side(
+        &mut server_stream,
+        &token,
+        &client.client_id,
+        tunnel.transport,
+    )
+    .await?;
+    let mut send_counter = 0;
+    write_session_frame(
+        &mut server_stream,
+        &crypto,
+        Direction::ClientToServer,
+        &mut send_counter,
+        &Frame::DataStart { conn_id },
+    )
+    .await?;
+    let local = TcpStream::connect(&mapping.local_addr).await?;
+    relay_tcp_stream(
+        local,
+        DataSession {
+            stream: server_stream,
+            crypto,
+            read_counter: 0,
+            write_counter: send_counter,
+        },
+        Direction::ServerToClient,
+        Direction::ClientToServer,
+    )
+    .await?;
     Ok(())
+}
+
+async fn relay_tcp_stream(
+    plain: TcpStream,
+    session: DataSession,
+    tunnel_read_direction: Direction,
+    tunnel_write_direction: Direction,
+) -> Result<()> {
+    let (mut plain_reader, mut plain_writer) = plain.into_split();
+    let (tunnel_reader, tunnel_writer) = tokio::io::split(session.stream);
+    let mut frame_reader = FrameReader::new(
+        tunnel_reader,
+        session.crypto.clone(),
+        tunnel_read_direction,
+        session.read_counter,
+    );
+    let mut frame_writer = FrameWriter::new(
+        tunnel_writer,
+        session.crypto,
+        tunnel_write_direction,
+        session.write_counter,
+    );
+
+    let plain_to_tunnel = async {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = plain_reader.read(&mut buf).await?;
+            if n == 0 {
+                frame_writer.write_frame(&Frame::DataEnd).await?;
+                break;
+            }
+            frame_writer
+                .write_frame(&Frame::Data {
+                    payload: buf[..n].to_vec(),
+                })
+                .await?;
+        }
+        Result::<()>::Ok(())
+    };
+
+    let tunnel_to_plain = async {
+        loop {
+            match frame_reader.read_frame().await? {
+                Frame::Data { payload } => plain_writer.write_all(&payload).await?,
+                Frame::DataEnd => break,
+                other => bail!("unexpected data frame: {:?}", other),
+            }
+        }
+        let _ = plain_writer.shutdown().await;
+        Result::<()>::Ok(())
+    };
+
+    tokio::select! {
+        result = plain_to_tunnel => result,
+        result = tunnel_to_plain => result,
+    }
 }
 
 async fn forward_udp_once(
@@ -980,31 +1274,36 @@ async fn forward_udp_once(
     }
 }
 
-async fn authenticate_server_side<S>(stream: &mut S, token: &str) -> Result<()>
+async fn authenticate_server_side<S>(
+    stream: &mut S,
+    token: &str,
+    transport: Transport,
+) -> Result<SessionCrypto>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut nonce = vec![0u8; 32];
-    OsRng.fill_bytes(&mut nonce);
+    let server_nonce = random_nonce_32();
     write_frame(
         stream,
         &Frame::AuthChallenge {
-            nonce: nonce.clone(),
+            nonce: server_nonce.clone(),
         },
     )
     .await?;
     let Frame::AuthProof {
         client_id,
         timestamp,
+        client_nonce,
         proof,
     } = read_frame(stream).await?
     else {
         bail!("expected auth proof");
     };
-    let expected = auth_proof(token, &client_id, &nonce, timestamp)?;
+    verify_timestamp(timestamp)?;
+    let expected = auth_proof(token, &client_id, &server_nonce, &client_nonce, timestamp)?;
     if expected.ct_eq(&proof).into() {
         write_frame(stream, &Frame::AuthOk).await?;
-        Ok(())
+        derive_session_crypto(transport, token, &server_nonce, &client_nonce)
     } else {
         write_frame(
             stream,
@@ -1017,55 +1316,182 @@ where
     }
 }
 
-async fn authenticate_client_side<S>(stream: &mut S, token: &str, client_id: &str) -> Result<()>
+async fn authenticate_client_side<S>(
+    stream: &mut S,
+    token: &str,
+    client_id: &str,
+    transport: Transport,
+) -> Result<SessionCrypto>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Frame::AuthChallenge { nonce } = read_frame(stream).await? else {
+    let Frame::AuthChallenge {
+        nonce: server_nonce,
+    } = read_frame(stream).await?
+    else {
         bail!("expected auth challenge");
     };
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let proof = auth_proof(token, client_id, &nonce, timestamp)?;
+    let client_nonce = random_nonce_32();
+    let timestamp = now_secs()?;
+    let proof = auth_proof(token, client_id, &server_nonce, &client_nonce, timestamp)?;
     write_frame(
         stream,
         &Frame::AuthProof {
             client_id: client_id.into(),
             timestamp,
+            client_nonce: client_nonce.clone(),
             proof,
         },
     )
     .await?;
     match read_frame(stream).await? {
-        Frame::AuthOk => Ok(()),
+        Frame::AuthOk => derive_session_crypto(transport, token, &server_nonce, &client_nonce),
         Frame::AuthFailed { message } => bail!("auth failed: {}", message),
         other => bail!("unexpected auth response: {:?}", other),
     }
 }
 
-fn auth_proof(token: &str, client_id: &str, nonce: &[u8], timestamp: u64) -> Result<Vec<u8>> {
-    let mut mac =
-        HmacSha256::new_from_slice(token.as_bytes()).map_err(|_| anyhow!("invalid hmac key"))?;
+fn auth_proof(
+    token: &str,
+    client_id: &str,
+    server_nonce: &[u8],
+    client_nonce: &[u8],
+    timestamp: u64,
+) -> Result<Vec<u8>> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(token.as_bytes())
+        .map_err(|_| anyhow!("invalid hmac key"))?;
+    mac.update(b"erp-auth-v2");
     mac.update(client_id.as_bytes());
     mac.update(&timestamp.to_be_bytes());
-    mac.update(nonce);
+    mac.update(server_nonce);
+    mac.update(client_nonce);
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
-fn make_direct_hello(token: &str, client_id: &str, remote_port: u16) -> Result<Vec<u8>> {
+fn derive_session_crypto(
+    transport: Transport,
+    token: &str,
+    server_nonce: &[u8],
+    client_nonce: &[u8],
+) -> Result<SessionCrypto> {
+    match transport {
+        Transport::Raw => Ok(SessionCrypto::Raw),
+        Transport::Aes128Gcm => {
+            let mut key = [0u8; 16];
+            expand_session_key(
+                token,
+                server_nonce,
+                client_nonce,
+                b"erp-session-aes-128-gcm-v1",
+                &mut key,
+            )?;
+            Ok(SessionCrypto::Aes128(Box::new(
+                Aes128Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid aes key"))?,
+            )))
+        }
+        Transport::Aes256Gcm => {
+            let mut key = [0u8; 32];
+            expand_session_key(
+                token,
+                server_nonce,
+                client_nonce,
+                b"erp-session-aes-256-gcm-v1",
+                &mut key,
+            )?;
+            Ok(SessionCrypto::Aes256(Box::new(
+                Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid aes key"))?,
+            )))
+        }
+        Transport::Tls => {
+            bail!("transport = \"tls\" is deprecated; use \"aes-256-gcm\" or \"raw\"")
+        }
+    }
+}
+
+fn expand_session_key(
+    token: &str,
+    server_nonce: &[u8],
+    client_nonce: &[u8],
+    info: &[u8],
+    out: &mut [u8],
+) -> Result<()> {
+    let mut salt = Vec::with_capacity(server_nonce.len() + client_nonce.len());
+    salt.extend_from_slice(server_nonce);
+    salt.extend_from_slice(client_nonce);
+    Hkdf::<Sha256>::new(Some(&salt), token.as_bytes())
+        .expand(info, out)
+        .map_err(|_| anyhow!("failed to derive session key"))
+}
+
+fn encrypt_payload(
+    crypto: &SessionCrypto,
+    direction: Direction,
+    counter: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    match crypto {
+        SessionCrypto::Raw => Ok(payload.to_vec()),
+        SessionCrypto::Aes128(cipher) => cipher
+            .encrypt(Nonce::from_slice(&nonce_for(direction, counter)), payload)
+            .map_err(|_| anyhow!("failed to encrypt frame")),
+        SessionCrypto::Aes256(cipher) => cipher
+            .encrypt(Nonce::from_slice(&nonce_for(direction, counter)), payload)
+            .map_err(|_| anyhow!("failed to encrypt frame")),
+    }
+}
+
+fn decrypt_payload(
+    crypto: &SessionCrypto,
+    direction: Direction,
+    counter: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    match crypto {
+        SessionCrypto::Raw => Ok(payload.to_vec()),
+        SessionCrypto::Aes128(cipher) => cipher
+            .decrypt(Nonce::from_slice(&nonce_for(direction, counter)), payload)
+            .map_err(|_| anyhow!("failed to decrypt frame")),
+        SessionCrypto::Aes256(cipher) => cipher
+            .decrypt(Nonce::from_slice(&nonce_for(direction, counter)), payload)
+            .map_err(|_| anyhow!("failed to decrypt frame")),
+    }
+}
+
+fn nonce_for(direction: Direction, counter: u64) -> [u8; AES_NONCE_LEN] {
+    let mut nonce = [0u8; AES_NONCE_LEN];
+    nonce[0] = match direction {
+        Direction::ClientToServer => 1,
+        Direction::ServerToClient => 2,
+    };
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
+fn make_direct_hello(
+    token: &str,
+    transport: Transport,
+    client_id: &str,
+    remote_port: u16,
+) -> Result<Vec<u8>> {
     let timestamp = now_secs()?;
     let nonce = random_nonce();
     let proof = direct_hello_proof(token, client_id, remote_port, timestamp, &nonce)?;
-    Ok(bincode::serialize(&UdpDatagram::Hello {
-        client_id: client_id.to_string(),
-        remote_port,
-        timestamp,
-        nonce,
-        proof,
-    })?)
+    encode_direct_frame(
+        token,
+        transport,
+        &UdpDatagram::Hello {
+            client_id: client_id.to_string(),
+            remote_port,
+            timestamp,
+            nonce,
+            proof,
+        },
+    )
 }
 
 fn make_direct_packet(
     token: &str,
+    transport: Transport,
     remote_port: u16,
     peer: SocketAddr,
     payload: Vec<u8>,
@@ -1073,14 +1499,130 @@ fn make_direct_packet(
     let timestamp = now_secs()?;
     let nonce = random_nonce();
     let proof = direct_packet_proof(token, remote_port, peer, &payload, timestamp, &nonce)?;
-    Ok(bincode::serialize(&UdpDatagram::Packet {
-        remote_port,
-        peer,
-        payload,
-        timestamp,
-        nonce,
-        proof,
-    })?)
+    encode_direct_frame(
+        token,
+        transport,
+        &UdpDatagram::Packet {
+            remote_port,
+            peer,
+            payload,
+            timestamp,
+            nonce,
+            proof,
+        },
+    )
+}
+
+fn encode_direct_frame(
+    token: &str,
+    transport: Transport,
+    datagram: &UdpDatagram,
+) -> Result<Vec<u8>> {
+    match transport {
+        Transport::Raw => Ok(bincode::serialize(&DirectUdpFrame::Plain(
+            datagram.clone(),
+        ))?),
+        Transport::Aes128Gcm | Transport::Aes256Gcm => {
+            let plaintext = bincode::serialize(datagram)?;
+            let nonce = random_nonce_12();
+            let ciphertext = encrypt_direct_payload(token, transport, &nonce, &plaintext)?;
+            Ok(bincode::serialize(&DirectUdpFrame::Encrypted {
+                nonce,
+                ciphertext,
+            })?)
+        }
+        Transport::Tls => {
+            bail!("transport = \"tls\" is deprecated; use \"aes-256-gcm\" or \"raw\"")
+        }
+    }
+}
+
+fn decode_direct_frame(token: &str, transport: Transport, data: &[u8]) -> Result<UdpDatagram> {
+    match bincode::deserialize::<DirectUdpFrame>(data)? {
+        DirectUdpFrame::Plain(datagram) if transport == Transport::Raw => Ok(datagram),
+        DirectUdpFrame::Encrypted { nonce, ciphertext }
+            if transport == Transport::Aes128Gcm || transport == Transport::Aes256Gcm =>
+        {
+            let plaintext = decrypt_direct_payload(token, transport, &nonce, &ciphertext)?;
+            Ok(bincode::deserialize(&plaintext)?)
+        }
+        _ => bail!("direct udp transport mismatch"),
+    }
+}
+
+fn encrypt_direct_payload(
+    token: &str,
+    transport: Transport,
+    nonce: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if nonce.len() != AES_NONCE_LEN {
+        bail!("invalid direct udp nonce length");
+    }
+    match direct_crypto(token, transport)? {
+        SessionCrypto::Aes128(cipher) => cipher
+            .encrypt(Nonce::from_slice(nonce), payload)
+            .map_err(|_| anyhow!("failed to encrypt direct udp packet")),
+        SessionCrypto::Aes256(cipher) => cipher
+            .encrypt(Nonce::from_slice(nonce), payload)
+            .map_err(|_| anyhow!("failed to encrypt direct udp packet")),
+        SessionCrypto::Raw => Ok(payload.to_vec()),
+    }
+}
+
+fn decrypt_direct_payload(
+    token: &str,
+    transport: Transport,
+    nonce: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if nonce.len() != AES_NONCE_LEN {
+        bail!("invalid direct udp nonce length");
+    }
+    match direct_crypto(token, transport)? {
+        SessionCrypto::Aes128(cipher) => cipher
+            .decrypt(Nonce::from_slice(nonce), payload)
+            .map_err(|_| anyhow!("failed to decrypt direct udp packet")),
+        SessionCrypto::Aes256(cipher) => cipher
+            .decrypt(Nonce::from_slice(nonce), payload)
+            .map_err(|_| anyhow!("failed to decrypt direct udp packet")),
+        SessionCrypto::Raw => Ok(payload.to_vec()),
+    }
+}
+
+fn direct_crypto(token: &str, transport: Transport) -> Result<SessionCrypto> {
+    match transport {
+        Transport::Raw => Ok(SessionCrypto::Raw),
+        Transport::Aes128Gcm => {
+            let mut key = [0u8; 16];
+            Hkdf::<Sha256>::new(None, token.as_bytes())
+                .expand(b"erp-direct-udp-aes-128-gcm-v1", &mut key)
+                .map_err(|_| anyhow!("failed to derive direct udp key"))?;
+            Ok(SessionCrypto::Aes128(Box::new(
+                Aes128Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid aes key"))?,
+            )))
+        }
+        Transport::Aes256Gcm => {
+            let mut key = [0u8; 32];
+            Hkdf::<Sha256>::new(None, token.as_bytes())
+                .expand(b"erp-direct-udp-aes-256-gcm-v1", &mut key)
+                .map_err(|_| anyhow!("failed to derive direct udp key"))?;
+            Ok(SessionCrypto::Aes256(Box::new(
+                Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid aes key"))?,
+            )))
+        }
+        Transport::Tls => {
+            bail!("transport = \"tls\" is deprecated; use \"aes-256-gcm\" or \"raw\"")
+        }
+    }
+}
+
+fn crypto_transport(crypto: &SessionCrypto) -> Transport {
+    match crypto {
+        SessionCrypto::Raw => Transport::Raw,
+        SessionCrypto::Aes128(_) => Transport::Aes128Gcm,
+        SessionCrypto::Aes256(_) => Transport::Aes256Gcm,
+    }
 }
 
 fn verify_direct_hello(
@@ -1125,8 +1667,8 @@ fn direct_hello_proof(
     timestamp: u64,
     nonce: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut mac =
-        HmacSha256::new_from_slice(token.as_bytes()).map_err(|_| anyhow!("invalid hmac key"))?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(token.as_bytes())
+        .map_err(|_| anyhow!("invalid hmac key"))?;
     mac.update(b"erp-direct-hello-v1");
     mac.update(client_id.as_bytes());
     mac.update(&remote_port.to_be_bytes());
@@ -1143,8 +1685,8 @@ fn direct_packet_proof(
     timestamp: u64,
     nonce: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut mac =
-        HmacSha256::new_from_slice(token.as_bytes()).map_err(|_| anyhow!("invalid hmac key"))?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(token.as_bytes())
+        .map_err(|_| anyhow!("invalid hmac key"))?;
     mac.update(b"erp-direct-packet-v1");
     mac.update(&remote_port.to_be_bytes());
     mac.update(peer.to_string().as_bytes());
@@ -1172,7 +1714,35 @@ fn random_nonce() -> Vec<u8> {
     nonce
 }
 
+fn random_nonce_12() -> Vec<u8> {
+    let mut nonce = vec![0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
+fn random_nonce_32() -> Vec<u8> {
+    let mut nonce = vec![0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
 async fn read_frame<R>(reader: &mut R) -> Result<Frame>
+where
+    R: AsyncRead + Unpin,
+{
+    let buf = read_payload(reader).await?;
+    Ok(bincode::deserialize(&buf)?)
+}
+
+async fn write_frame<W>(writer: &mut W, frame: &Frame) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let data = bincode::serialize(frame)?;
+    write_payload(writer, &data).await
+}
+
+async fn read_payload<R>(reader: &mut R) -> Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
@@ -1182,16 +1752,15 @@ where
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
-    Ok(bincode::deserialize(&buf)?)
+    Ok(buf)
 }
 
-async fn write_frame<W>(writer: &mut W, frame: &Frame) -> Result<()>
+async fn write_payload<W>(writer: &mut W, data: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let data = bincode::serialize(frame)?;
     writer.write_u32(data.len() as u32).await?;
-    writer.write_all(&data).await?;
+    writer.write_all(data).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -1208,18 +1777,16 @@ mod tests {
     use tokio::io::duplex;
 
     #[test]
-    fn parses_client_config_with_tls_fields() {
+    fn parses_client_config_with_aes_transport() {
         let config: Config = toml::from_str(
             r#"
 role = "client"
 token = "secret"
-transport = "tls"
+transport = "aes-256-gcm"
 
 [client]
 server_addr = "example.com:7000"
 client_id = "office"
-tls_server_name = "example.com"
-tls_ca_cert_path = "ca.pem"
 
 [[client.mappings]]
 name = "web"
@@ -1231,18 +1798,46 @@ remote_port = 18080
         .unwrap();
 
         assert_eq!(config.role, Role::Client);
-        assert_eq!(config.transport, Transport::Tls);
+        assert_eq!(config.transport, Transport::Aes256Gcm);
         let client = config.client.unwrap();
-        assert_eq!(client.tls_server_name.as_deref(), Some("example.com"));
         assert_eq!(client.mappings[0].remote_port, 18080);
     }
 
     #[test]
+    fn deprecated_tls_config_is_rejected() {
+        let config: Config = toml::from_str(
+            r#"
+role = "client"
+token = "secret"
+transport = "tls"
+
+[client]
+server_addr = "example.com:7000"
+client_id = "office"
+
+[[client.mappings]]
+name = "web"
+protocol = "tcp"
+local_addr = "127.0.0.1:8080"
+remote_port = 18080
+"#,
+        )
+        .unwrap();
+
+        let err = match build_client_tunnel(config.transport, config.client.as_ref().unwrap()) {
+            Ok(_) => panic!("tls config should be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("deprecated"));
+    }
+
+    #[test]
     fn auth_proof_depends_on_token() {
-        let nonce = b"server-nonce";
-        let good = auth_proof("secret", "client-a", nonce, 42).unwrap();
-        let same = auth_proof("secret", "client-a", nonce, 42).unwrap();
-        let bad = auth_proof("other", "client-a", nonce, 42).unwrap();
+        let server_nonce = b"server-nonce";
+        let client_nonce = b"client-nonce";
+        let good = auth_proof("secret", "client-a", server_nonce, client_nonce, 42).unwrap();
+        let same = auth_proof("secret", "client-a", server_nonce, client_nonce, 42).unwrap();
+        let bad = auth_proof("other", "client-a", server_nonce, client_nonce, 42).unwrap();
 
         assert_eq!(good, same);
         assert_ne!(good, bad);
@@ -1250,21 +1845,22 @@ remote_port = 18080
 
     #[test]
     fn direct_udp_hello_and_packet_verify() {
-        let hello = make_direct_hello("secret", "client-a", 18080).unwrap();
+        let hello = make_direct_hello("secret", Transport::Raw, "client-a", 18080).unwrap();
         let UdpDatagram::Hello {
             client_id,
             remote_port,
             timestamp,
             nonce,
             proof,
-        } = bincode::deserialize::<UdpDatagram>(&hello).unwrap()
+        } = decode_direct_frame("secret", Transport::Raw, &hello).unwrap()
         else {
             panic!("expected hello datagram");
         };
         verify_direct_hello("secret", &client_id, remote_port, timestamp, &nonce, &proof).unwrap();
 
         let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
-        let packet = make_direct_packet("secret", 18080, peer, b"ping".to_vec()).unwrap();
+        let packet =
+            make_direct_packet("secret", Transport::Raw, 18080, peer, b"ping".to_vec()).unwrap();
         let UdpDatagram::Packet {
             remote_port,
             peer,
@@ -1272,7 +1868,7 @@ remote_port = 18080
             timestamp,
             nonce,
             proof,
-        } = bincode::deserialize::<UdpDatagram>(&packet).unwrap()
+        } = decode_direct_frame("secret", Transport::Raw, &packet).unwrap()
         else {
             panic!("expected packet datagram");
         };
@@ -1289,9 +1885,23 @@ remote_port = 18080
     }
 
     #[test]
-    fn default_tls_name_uses_host_part() {
-        assert_eq!(default_tls_server_name("example.com:7000"), "example.com");
-        assert_eq!(default_tls_server_name("[::1]:7000"), "::1");
+    fn aes_direct_udp_packet_hides_payload() {
+        let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let packet = make_direct_packet(
+            "secret",
+            Transport::Aes256Gcm,
+            18080,
+            peer,
+            b"ping".to_vec(),
+        )
+        .unwrap();
+        assert!(!packet.windows(4).any(|window| window == b"ping"));
+        let UdpDatagram::Packet { payload, .. } =
+            decode_direct_frame("secret", Transport::Aes256Gcm, &packet).unwrap()
+        else {
+            panic!("expected packet datagram");
+        };
+        assert_eq!(payload, b"ping");
     }
 
     #[tokio::test]
@@ -1312,6 +1922,38 @@ remote_port = 18080
         writer.await.unwrap();
         match frame {
             Frame::AuthFailed { message } => assert_eq!(message, "nope"),
+            _ => panic!("unexpected frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn aes_session_frame_hides_error_text() {
+        let crypto =
+            derive_session_crypto(Transport::Aes256Gcm, "secret", b"server", b"client").unwrap();
+        let (mut a, mut b) = duplex(2048);
+        let writer_crypto = crypto.clone();
+        let writer = tokio::spawn(async move {
+            let mut counter = 0;
+            write_session_frame(
+                &mut a,
+                &writer_crypto,
+                Direction::ServerToClient,
+                &mut counter,
+                &Frame::RegisterFailed {
+                    message: "remote port 8080 is already registered".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let raw = read_payload(&mut b).await.unwrap();
+        writer.await.unwrap();
+        assert!(!raw.windows(11).any(|window| window == b"remote port"));
+        let decrypted = decrypt_payload(&crypto, Direction::ServerToClient, 0, &raw).unwrap();
+        let frame: Frame = bincode::deserialize(&decrypted).unwrap();
+        match frame {
+            Frame::RegisterFailed { message } => assert!(message.contains("8080")),
             _ => panic!("unexpected frame"),
         }
     }
