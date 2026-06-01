@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: erp-x86_64-unknown-linux-gnu
+            bin: erp
+          - os: windows-latest
+            name: erp-x86_64-pc-windows-msvc
+            bin: erp.exe
+          - os: macos-latest
+            name: erp-x86_64-apple-darwin
+            bin: erp
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.name }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+

@@ -1,0 +1,10 @@
+role = "server"
+token = "change-me"
+transport = "tls"
+
+[server]
+bind_addr = "0.0.0.0"
+control_port = 7000
+tls_cert_path = "server.crt"
+tls_key_path = "server.key"
+

@@ -1,0 +1,16 @@
+role = "client"
+token = "change-me"
+transport = "tls"
+
+[client]
+server_addr = "example.com:7000"
+client_id = "office"
+tls_server_name = "example.com"
+tls_ca_cert_path = "ca.crt"
+
+[[client.mappings]]
+name = "web"
+protocol = "tcp"
+local_addr = "127.0.0.1:8080"
+remote_port = 18080
+

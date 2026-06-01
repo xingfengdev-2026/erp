@@ -1,0 +1,21 @@
+role = "client"
+token = "change-me"
+transport = "raw"
+
+[client]
+server_addr = "127.0.0.1:7000"
+client_id = "local-dev"
+
+[[client.mappings]]
+name = "web"
+protocol = "tcp"
+local_addr = "127.0.0.1:8080"
+remote_port = 18080
+
+[[client.mappings]]
+name = "dns-over-tcp-tunnel"
+protocol = "udp"
+local_addr = "127.0.0.1:5353"
+remote_port = 15353
+udp_mode = "over_tcp"
+
