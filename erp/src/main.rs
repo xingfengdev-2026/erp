@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    env,
+    env, io,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -23,7 +23,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, mpsc, oneshot},
-    time::{Duration, timeout},
+    time::{Duration, sleep, timeout},
 };
 use tracing::{debug, info, warn};
 
@@ -32,6 +32,10 @@ type BoxedStream = Box<dyn TunnelStream>;
 const DIRECT_AUTH_WINDOW_SECS: u64 = 300;
 const AES_NONCE_LEN: usize = 12;
 const DEFAULT_RAW_AES_INFO: &[u8] = b"erp-session-raw-aes-256-gcm-v2";
+#[cfg(unix)]
+const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
+const CONTROL_CHANNEL_CAPACITY: usize = 65_536;
+const ACCEPT_FD_BACKOFF: Duration = Duration::from_millis(100);
 
 trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -326,6 +330,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    configure_process_limits();
 
     let cli = Cli::parse();
     let command = match cli.command {
@@ -582,6 +587,78 @@ fn build_client_tunnel(transport: Transport, _client: &ClientConfig) -> Result<C
     }
 }
 
+fn configure_process_limits() {
+    #[cfg(unix)]
+    configure_unix_nofile_limit();
+}
+
+#[cfg(unix)]
+fn configure_unix_nofile_limit() {
+    let requested = env::var("ERP_NOFILE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NOFILE_LIMIT);
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if rc != 0 {
+        warn!(
+            "failed to read RLIMIT_NOFILE: {}",
+            io::Error::last_os_error()
+        );
+        return;
+    }
+
+    let hard = limit.rlim_max;
+    let target = if hard == libc::RLIM_INFINITY {
+        requested as libc::rlim_t
+    } else {
+        (requested as libc::rlim_t).min(hard)
+    };
+
+    if target > limit.rlim_cur {
+        let next = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: limit.rlim_max,
+        };
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) };
+        if rc != 0 {
+            warn!(
+                "failed to raise RLIMIT_NOFILE from {} to {}: {}",
+                limit.rlim_cur,
+                target,
+                io::Error::last_os_error()
+            );
+        } else {
+            limit.rlim_cur = target;
+        }
+    }
+
+    if limit.rlim_cur < requested as libc::rlim_t {
+        warn!(
+            "RLIMIT_NOFILE is {}; requested {}. Raise the service/user hard limit for very high concurrency.",
+            limit.rlim_cur, requested
+        );
+    } else {
+        info!("RLIMIT_NOFILE soft limit is {}", limit.rlim_cur);
+    }
+}
+
+fn is_fd_exhaustion(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(err.raw_os_error(), Some(code) if code == libc::EMFILE || code == libc::ENFILE)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
 async fn accept_tunnel(stream: TcpStream, tunnel: &ServerTunnel) -> Result<BoxedStream> {
     let _ = tunnel;
     Ok(Box::new(stream))
@@ -609,7 +686,15 @@ async fn run_server(config: Config) -> Result<()> {
     info!("server listening on {}", control_addr);
 
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) if is_fd_exhaustion(&err) => {
+                warn!("control accept hit file descriptor limit: {err}");
+                sleep(ACCEPT_FD_BACKOFF).await;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         let state = state.clone();
         let token = config.token.clone();
         let tunnel = tunnel.clone();
@@ -713,7 +798,7 @@ async fn handle_registration(
         read_counter,
     );
     let mut writer = FrameWriter::new(writer_half, crypto.clone(), Direction::ServerToClient, 0);
-    let (tx, mut rx) = mpsc::channel::<Frame>(128);
+    let (tx, mut rx) = mpsc::channel::<Frame>(CONTROL_CHANNEL_CAPACITY);
     let mut listener_tasks = Vec::new();
     let owned_mappings = mappings
         .iter()
@@ -854,8 +939,18 @@ async fn spawn_tcp_listener(
     info!("tcp remote port {} listening", remote_port);
     let task = tokio::spawn(async move {
         loop {
-            let Ok((inbound, _)) = listener.accept().await else {
-                continue;
+            let inbound = match listener.accept().await {
+                Ok((inbound, _)) => inbound,
+                Err(err) if is_fd_exhaustion(&err) => {
+                    warn!("tcp remote port {remote_port} accept hit file descriptor limit: {err}");
+                    sleep(ACCEPT_FD_BACKOFF).await;
+                    continue;
+                }
+                Err(err) => {
+                    warn!("tcp remote port {remote_port} accept failed: {err}");
+                    sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
             };
             let state = state.clone();
             let tx = tx.clone();
@@ -1148,7 +1243,7 @@ async fn run_client(config: Config) -> Result<()> {
         recv_counter,
     );
     let mut writer = FrameWriter::new(writer, crypto, Direction::ClientToServer, send_counter);
-    let (tx, mut rx) = mpsc::channel::<Frame>(128);
+    let (tx, mut rx) = mpsc::channel::<Frame>(CONTROL_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if writer.write_frame(&frame).await.is_err() {

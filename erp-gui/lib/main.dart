@@ -74,6 +74,8 @@ class _HomePageState extends State<HomePage> {
 
   ErpProfile get _profile => _profiles[_selectedIndex];
   bool get _running => _runningProfileId != null;
+  bool get _connecting => _busy && !_running;
+  bool get _disconnecting => _busy && _running;
 
   @override
   void initState() {
@@ -299,7 +301,12 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _showImport() async {
     final linkController = TextEditingController();
-    final passController = TextEditingController();
+    final clipboard = await Clipboard.getData(Clipboard.kTextPlain);
+    final clipboardText = clipboard?.text?.trim();
+    if (clipboardText != null && clipboardText.startsWith('erp://')) {
+      linkController.text = clipboardText;
+    }
+    if (!mounted) return;
     final profile = await showDialog<ErpProfile>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -316,15 +323,6 @@ class _HomePageState extends State<HomePage> {
                 border: OutlineInputBorder(),
               ),
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: passController,
-              obscureText: true,
-              decoration: const InputDecoration(
-                labelText: 'Legacy passphrase (optional)',
-                border: OutlineInputBorder(),
-              ),
-            ),
           ],
         ),
         actions: [
@@ -337,10 +335,7 @@ class _HomePageState extends State<HomePage> {
               final navigator = Navigator.of(dialogContext);
               final messenger = ScaffoldMessenger.of(dialogContext);
               try {
-                final imported = await _share.decode(
-                  linkController.text,
-                  passController.text,
-                );
+                final imported = await _share.decode(linkController.text);
                 navigator.pop(
                   imported.copyWith(
                     id: DateTime.now().microsecondsSinceEpoch.toString(),
@@ -375,6 +370,13 @@ class _HomePageState extends State<HomePage> {
         .where((profile) => profile.id == _runningProfileId)
         .map((profile) => profile.name)
         .firstOrNull;
+    final fabLabel = _connecting
+        ? 'Connecting'
+        : _disconnecting
+        ? 'Disconnecting'
+        : _running
+        ? 'Disconnect'
+        : 'Connect';
 
     return Scaffold(
       appBar: AppBar(
@@ -404,14 +406,31 @@ class _HomePageState extends State<HomePage> {
       ),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _busy ? null : _toggleConnection,
-        icon: Icon(_running ? Icons.link_off : Icons.link),
-        label: Text(_running ? 'Disconnect' : 'Connect'),
+        icon: _busy
+            ? const SizedBox.square(
+                dimension: 18,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : Icon(_running ? Icons.link_off : Icons.link),
+        label: Text(fabLabel),
       ),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 96),
           children: [
-            if (_running)
+            if (_connecting)
+              _StatusBanner(
+                label: 'Connecting: ${_profile.name}',
+                active: false,
+                busy: true,
+              )
+            else if (_disconnecting)
+              _StatusBanner(
+                label: 'Disconnecting: ${runningName ?? 'unknown'}',
+                active: false,
+                busy: true,
+              )
+            else if (_running)
               _StatusBanner(
                 label: 'Connected: ${runningName ?? 'unknown'}',
                 active: true,
@@ -441,10 +460,15 @@ class _HomePageState extends State<HomePage> {
 }
 
 class _StatusBanner extends StatelessWidget {
-  const _StatusBanner({required this.label, required this.active});
+  const _StatusBanner({
+    required this.label,
+    required this.active,
+    this.busy = false,
+  });
 
   final String label;
   final bool active;
+  final bool busy;
 
   @override
   Widget build(BuildContext context) {
@@ -459,7 +483,13 @@ class _StatusBanner extends StatelessWidget {
       ),
       child: Row(
         children: [
-          Icon(active ? Icons.check_circle : Icons.radio_button_unchecked),
+          if (busy)
+            const SizedBox.square(
+              dimension: 22,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          else
+            Icon(active ? Icons.check_circle : Icons.radio_button_unchecked),
           const SizedBox(width: 10),
           Expanded(child: Text(label)),
         ],

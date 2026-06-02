@@ -5,6 +5,17 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+val erpAndroidKeystore = System.getenv("ERP_ANDROID_KEYSTORE")
+val erpAndroidKeystorePassword = System.getenv("ERP_ANDROID_KEYSTORE_PASSWORD")
+val erpAndroidKeyAlias = System.getenv("ERP_ANDROID_KEY_ALIAS")
+val erpAndroidKeyPassword = System.getenv("ERP_ANDROID_KEY_PASSWORD")
+val hasErpReleaseSigning = listOf(
+    erpAndroidKeystore,
+    erpAndroidKeystorePassword,
+    erpAndroidKeyAlias,
+    erpAndroidKeyPassword,
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "uk.nam2.erp.erp_gui"
     compileSdk = flutter.compileSdkVersion
@@ -35,9 +46,29 @@ android {
         }
     }
 
+    signingConfigs {
+        create("erpRelease") {
+            if (hasErpReleaseSigning) {
+                storeFile = file(erpAndroidKeystore!!)
+                storePassword = erpAndroidKeystorePassword!!
+                keyAlias = erpAndroidKeyAlias!!
+                keyPassword = erpAndroidKeyPassword!!
+            }
+        }
+    }
+
     buildTypes {
-        release {
-            signingConfig = signingConfigs.getByName("debug")
+        debug {
+            if (hasErpReleaseSigning) {
+                signingConfig = signingConfigs.getByName("erpRelease")
+            }
+        }
+        getByName("release") {
+            signingConfig = if (hasErpReleaseSigning) {
+                signingConfigs.getByName("erpRelease")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }

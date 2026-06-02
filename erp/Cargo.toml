@@ -1,6 +1,6 @@
 [package]
 name = "erp"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 
 [lib]
@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
 hkdf = "0.12"
 hmac = "0.12"
+libc = "0.2"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
