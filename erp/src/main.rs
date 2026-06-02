@@ -9,7 +9,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -31,6 +31,7 @@ type HmacSha256 = Hmac<Sha256>;
 type BoxedStream = Box<dyn TunnelStream>;
 const DIRECT_AUTH_WINDOW_SECS: u64 = 300;
 const AES_NONCE_LEN: usize = 12;
+const DEFAULT_RAW_AES_INFO: &[u8] = b"erp-session-raw-aes-256-gcm-v2";
 
 trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -132,6 +133,7 @@ struct MappingConfig {
 enum Frame {
     AuthChallenge {
         nonce: Vec<u8>,
+        key_rounds: u8,
     },
     AuthProof {
         client_id: String,
@@ -180,6 +182,7 @@ enum Frame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum UdpDatagram {
     Hello {
+        key_rounds: u8,
         client_id: String,
         remote_port: u16,
         timestamp: u64,
@@ -187,6 +190,7 @@ enum UdpDatagram {
         proof: Vec<u8>,
     },
     Packet {
+        key_rounds: u8,
         remote_port: u16,
         peer: SocketAddr,
         payload: Vec<u8>,
@@ -198,8 +202,17 @@ enum UdpDatagram {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum DirectUdpFrame {
-    Plain(UdpDatagram),
-    Encrypted { nonce: Vec<u8>, ciphertext: Vec<u8> },
+    Encrypted {
+        key_rounds: u8,
+        nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+    },
+}
+
+struct DirectProofRef<'a> {
+    timestamp: u64,
+    nonce: &'a [u8],
+    proof: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,7 +223,6 @@ enum Direction {
 
 #[derive(Clone)]
 enum SessionCrypto {
-    Raw,
     Aes128(Box<Aes128Gcm>),
     Aes256(Box<Aes256Gcm>),
 }
@@ -655,7 +667,16 @@ async fn handle_server_conn(
     .await?;
     match frame {
         Frame::Register { mappings } => {
-            handle_registration(stream, state, token, mappings, crypto, recv_counter).await
+            handle_registration(
+                stream,
+                state,
+                token,
+                transport,
+                mappings,
+                crypto,
+                recv_counter,
+            )
+            .await
         }
         Frame::DataStart { conn_id } => {
             let sender = state.pending.lock().await.remove(&conn_id);
@@ -679,6 +700,7 @@ async fn handle_registration(
     stream: BoxedStream,
     state: Arc<ServerState>,
     token: String,
+    transport: Transport,
     mappings: Vec<MappingConfig>,
     crypto: SessionCrypto,
     read_counter: u64,
@@ -730,14 +752,8 @@ async fn handle_registration(
             Protocol::Tcp => listener_tasks
                 .push(spawn_tcp_listener(mapping.remote_port, state.clone(), tx.clone()).await?),
             Protocol::Udp => listener_tasks.push(
-                spawn_udp_listener(
-                    mapping,
-                    state.clone(),
-                    tx.clone(),
-                    token.clone(),
-                    crypto_transport(&crypto),
-                )
-                .await?,
+                spawn_udp_listener(mapping, state.clone(), tx.clone(), token.clone(), transport)
+                    .await?,
             ),
         }
     }
@@ -949,6 +965,7 @@ fn spawn_direct_udp_server(
             };
             match decode_direct_frame(&token, transport, &buf[..n]) {
                 Ok(UdpDatagram::Hello {
+                    key_rounds,
                     client_id,
                     remote_port,
                     timestamp,
@@ -957,11 +974,14 @@ fn spawn_direct_udp_server(
                 }) => {
                     if verify_direct_hello(
                         &token,
+                        key_rounds,
                         &client_id,
                         remote_port,
-                        timestamp,
-                        &nonce,
-                        &proof,
+                        DirectProofRef {
+                            timestamp,
+                            nonce: &nonce,
+                            proof: &proof,
+                        },
                     )
                     .is_ok()
                     {
@@ -969,6 +989,7 @@ fn spawn_direct_udp_server(
                     }
                 }
                 Ok(UdpDatagram::Packet {
+                    key_rounds,
                     remote_port,
                     peer,
                     payload,
@@ -978,12 +999,15 @@ fn spawn_direct_udp_server(
                 }) => {
                     if verify_direct_packet(
                         &token,
+                        key_rounds,
                         remote_port,
                         peer,
                         &payload,
-                        timestamp,
-                        &nonce,
-                        &proof,
+                        DirectProofRef {
+                            timestamp,
+                            nonce: &nonce,
+                            proof: &proof,
+                        },
                     )
                     .is_err()
                     {
@@ -1025,6 +1049,7 @@ async fn spawn_direct_udp_client(
                 continue;
             };
             let Ok(UdpDatagram::Packet {
+                key_rounds,
                 remote_port,
                 peer,
                 payload,
@@ -1037,12 +1062,15 @@ async fn spawn_direct_udp_client(
             };
             if verify_direct_packet(
                 &token,
+                key_rounds,
                 remote_port,
                 peer,
                 &payload,
-                timestamp,
-                &nonce,
-                &proof,
+                DirectProofRef {
+                    timestamp,
+                    nonce: &nonce,
+                    proof: &proof,
+                },
             )
             .is_err()
             {
@@ -1307,30 +1335,59 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let server_nonce = random_nonce_32();
+    let key_rounds = random_key_rounds();
     write_frame(
         stream,
         &Frame::AuthChallenge {
             nonce: server_nonce.clone(),
+            key_rounds,
         },
     )
     .await?;
+    let handshake_crypto = derive_handshake_crypto(token, &server_nonce, key_rounds)?;
+    let mut auth_recv_counter = 0;
     let Frame::AuthProof {
         client_id,
         timestamp,
         client_nonce,
         proof,
-    } = read_frame(stream).await?
+    } = read_session_frame(
+        stream,
+        &handshake_crypto,
+        Direction::ClientToServer,
+        &mut auth_recv_counter,
+    )
+    .await?
     else {
         bail!("expected auth proof");
     };
     verify_timestamp(timestamp)?;
-    let expected = auth_proof(token, &client_id, &server_nonce, &client_nonce, timestamp)?;
+    let expected = auth_proof(
+        token,
+        key_rounds,
+        &client_id,
+        &server_nonce,
+        &client_nonce,
+        timestamp,
+    )?;
     if expected.ct_eq(&proof).into() {
-        write_frame(stream, &Frame::AuthOk).await?;
-        derive_session_crypto(transport, token, &server_nonce, &client_nonce)
-    } else {
-        write_frame(
+        let mut auth_send_counter = 0;
+        write_session_frame(
             stream,
+            &handshake_crypto,
+            Direction::ServerToClient,
+            &mut auth_send_counter,
+            &Frame::AuthOk,
+        )
+        .await?;
+        derive_session_crypto(transport, token, key_rounds, &server_nonce, &client_nonce)
+    } else {
+        let mut auth_send_counter = 0;
+        write_session_frame(
+            stream,
+            &handshake_crypto,
+            Direction::ServerToClient,
+            &mut auth_send_counter,
             &Frame::AuthFailed {
                 message: "invalid token proof".into(),
             },
@@ -1351,15 +1408,28 @@ where
 {
     let Frame::AuthChallenge {
         nonce: server_nonce,
+        key_rounds,
     } = read_frame(stream).await?
     else {
         bail!("expected auth challenge");
     };
+    let handshake_crypto = derive_handshake_crypto(token, &server_nonce, key_rounds)?;
     let client_nonce = random_nonce_32();
     let timestamp = now_secs()?;
-    let proof = auth_proof(token, client_id, &server_nonce, &client_nonce, timestamp)?;
-    write_frame(
+    let proof = auth_proof(
+        token,
+        key_rounds,
+        client_id,
+        &server_nonce,
+        &client_nonce,
+        timestamp,
+    )?;
+    let mut auth_send_counter = 0;
+    write_session_frame(
         stream,
+        &handshake_crypto,
+        Direction::ClientToServer,
+        &mut auth_send_counter,
         &Frame::AuthProof {
             client_id: client_id.into(),
             timestamp,
@@ -1368,8 +1438,18 @@ where
         },
     )
     .await?;
-    match read_frame(stream).await? {
-        Frame::AuthOk => derive_session_crypto(transport, token, &server_nonce, &client_nonce),
+    let mut auth_recv_counter = 0;
+    match read_session_frame(
+        stream,
+        &handshake_crypto,
+        Direction::ServerToClient,
+        &mut auth_recv_counter,
+    )
+    .await?
+    {
+        Frame::AuthOk => {
+            derive_session_crypto(transport, token, key_rounds, &server_nonce, &client_nonce)
+        }
         Frame::AuthFailed { message } => bail!("auth failed: {}", message),
         other => bail!("unexpected auth response: {:?}", other),
     }
@@ -1377,14 +1457,17 @@ where
 
 fn auth_proof(
     token: &str,
+    key_rounds: u8,
     client_id: &str,
     server_nonce: &[u8],
     client_nonce: &[u8],
     timestamp: u64,
 ) -> Result<Vec<u8>> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(token.as_bytes())
-        .map_err(|_| anyhow!("invalid hmac key"))?;
-    mac.update(b"erp-auth-v2");
+    let key = token_round_key(token, key_rounds);
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(&key).map_err(|_| anyhow!("invalid hmac key"))?;
+    mac.update(b"erp-auth-v3");
+    mac.update(&[key_rounds]);
     mac.update(client_id.as_bytes());
     mac.update(&timestamp.to_be_bytes());
     mac.update(server_nonce);
@@ -1392,18 +1475,48 @@ fn auth_proof(
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
+fn derive_handshake_crypto(
+    token: &str,
+    server_nonce: &[u8],
+    key_rounds: u8,
+) -> Result<SessionCrypto> {
+    let mut key = [0u8; 32];
+    let token_key = token_round_key(token, key_rounds);
+    Hkdf::<Sha256>::new(Some(server_nonce), &token_key)
+        .expand(b"erp-auth-handshake-aes-256-gcm-v1", &mut key)
+        .map_err(|_| anyhow!("failed to derive handshake key"))?;
+    Ok(SessionCrypto::Aes256(Box::new(
+        Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid aes key"))?,
+    )))
+}
+
 fn derive_session_crypto(
     transport: Transport,
     token: &str,
+    key_rounds: u8,
     server_nonce: &[u8],
     client_nonce: &[u8],
 ) -> Result<SessionCrypto> {
     match transport {
-        Transport::Raw => Ok(SessionCrypto::Raw),
+        Transport::Raw => {
+            let mut key = [0u8; 32];
+            expand_session_key(
+                token,
+                key_rounds,
+                server_nonce,
+                client_nonce,
+                DEFAULT_RAW_AES_INFO,
+                &mut key,
+            )?;
+            Ok(SessionCrypto::Aes256(Box::new(
+                Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid aes key"))?,
+            )))
+        }
         Transport::Aes128Gcm => {
             let mut key = [0u8; 16];
             expand_session_key(
                 token,
+                key_rounds,
                 server_nonce,
                 client_nonce,
                 b"erp-session-aes-128-gcm-v1",
@@ -1417,6 +1530,7 @@ fn derive_session_crypto(
             let mut key = [0u8; 32];
             expand_session_key(
                 token,
+                key_rounds,
                 server_nonce,
                 client_nonce,
                 b"erp-session-aes-256-gcm-v1",
@@ -1434,6 +1548,7 @@ fn derive_session_crypto(
 
 fn expand_session_key(
     token: &str,
+    key_rounds: u8,
     server_nonce: &[u8],
     client_nonce: &[u8],
     info: &[u8],
@@ -1442,9 +1557,20 @@ fn expand_session_key(
     let mut salt = Vec::with_capacity(server_nonce.len() + client_nonce.len());
     salt.extend_from_slice(server_nonce);
     salt.extend_from_slice(client_nonce);
-    Hkdf::<Sha256>::new(Some(&salt), token.as_bytes())
+    let token_key = token_round_key(token, key_rounds);
+    Hkdf::<Sha256>::new(Some(&salt), &token_key)
         .expand(info, out)
         .map_err(|_| anyhow!("failed to derive session key"))
+}
+
+fn token_round_key(token: &str, key_rounds: u8) -> [u8; 32] {
+    let mut material = token.as_bytes().to_vec();
+    for _ in 0..key_rounds.max(1) {
+        material = Sha256::digest(&material).to_vec();
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&material[..32]);
+    key
 }
 
 fn encrypt_payload(
@@ -1454,7 +1580,6 @@ fn encrypt_payload(
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     match crypto {
-        SessionCrypto::Raw => Ok(payload.to_vec()),
         SessionCrypto::Aes128(cipher) => cipher
             .encrypt(Nonce::from_slice(&nonce_for(direction, counter)), payload)
             .map_err(|_| anyhow!("failed to encrypt frame")),
@@ -1471,7 +1596,6 @@ fn decrypt_payload(
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     match crypto {
-        SessionCrypto::Raw => Ok(payload.to_vec()),
         SessionCrypto::Aes128(cipher) => cipher
             .decrypt(Nonce::from_slice(&nonce_for(direction, counter)), payload)
             .map_err(|_| anyhow!("failed to decrypt frame")),
@@ -1497,13 +1621,16 @@ fn make_direct_hello(
     client_id: &str,
     remote_port: u16,
 ) -> Result<Vec<u8>> {
+    let key_rounds = random_key_rounds();
     let timestamp = now_secs()?;
     let nonce = random_nonce();
-    let proof = direct_hello_proof(token, client_id, remote_port, timestamp, &nonce)?;
+    let proof = direct_hello_proof(token, key_rounds, client_id, remote_port, timestamp, &nonce)?;
     encode_direct_frame(
         token,
         transport,
+        key_rounds,
         &UdpDatagram::Hello {
+            key_rounds,
             client_id: client_id.to_string(),
             remote_port,
             timestamp,
@@ -1520,13 +1647,24 @@ fn make_direct_packet(
     peer: SocketAddr,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>> {
+    let key_rounds = random_key_rounds();
     let timestamp = now_secs()?;
     let nonce = random_nonce();
-    let proof = direct_packet_proof(token, remote_port, peer, &payload, timestamp, &nonce)?;
+    let proof = direct_packet_proof(
+        token,
+        key_rounds,
+        remote_port,
+        peer,
+        &payload,
+        timestamp,
+        &nonce,
+    )?;
     encode_direct_frame(
         token,
         transport,
+        key_rounds,
         &UdpDatagram::Packet {
+            key_rounds,
             remote_port,
             peer,
             payload,
@@ -1540,17 +1678,17 @@ fn make_direct_packet(
 fn encode_direct_frame(
     token: &str,
     transport: Transport,
+    key_rounds: u8,
     datagram: &UdpDatagram,
 ) -> Result<Vec<u8>> {
     match transport {
-        Transport::Raw => Ok(bincode::serialize(&DirectUdpFrame::Plain(
-            datagram.clone(),
-        ))?),
-        Transport::Aes128Gcm | Transport::Aes256Gcm => {
+        Transport::Raw | Transport::Aes128Gcm | Transport::Aes256Gcm => {
             let plaintext = bincode::serialize(datagram)?;
             let nonce = random_nonce_12();
-            let ciphertext = encrypt_direct_payload(token, transport, &nonce, &plaintext)?;
+            let ciphertext =
+                encrypt_direct_payload(token, transport, key_rounds, &nonce, &plaintext)?;
             Ok(bincode::serialize(&DirectUdpFrame::Encrypted {
+                key_rounds,
                 nonce,
                 ciphertext,
             })?)
@@ -1563,11 +1701,13 @@ fn encode_direct_frame(
 
 fn decode_direct_frame(token: &str, transport: Transport, data: &[u8]) -> Result<UdpDatagram> {
     match bincode::deserialize::<DirectUdpFrame>(data)? {
-        DirectUdpFrame::Plain(datagram) if transport == Transport::Raw => Ok(datagram),
-        DirectUdpFrame::Encrypted { nonce, ciphertext }
-            if transport == Transport::Aes128Gcm || transport == Transport::Aes256Gcm =>
-        {
-            let plaintext = decrypt_direct_payload(token, transport, &nonce, &ciphertext)?;
+        DirectUdpFrame::Encrypted {
+            key_rounds,
+            nonce,
+            ciphertext,
+        } if transport != Transport::Tls => {
+            let plaintext =
+                decrypt_direct_payload(token, transport, key_rounds, &nonce, &ciphertext)?;
             Ok(bincode::deserialize(&plaintext)?)
         }
         _ => bail!("direct udp transport mismatch"),
@@ -1577,49 +1717,59 @@ fn decode_direct_frame(token: &str, transport: Transport, data: &[u8]) -> Result
 fn encrypt_direct_payload(
     token: &str,
     transport: Transport,
+    key_rounds: u8,
     nonce: &[u8],
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     if nonce.len() != AES_NONCE_LEN {
         bail!("invalid direct udp nonce length");
     }
-    match direct_crypto(token, transport)? {
+    match direct_crypto(token, transport, key_rounds)? {
         SessionCrypto::Aes128(cipher) => cipher
             .encrypt(Nonce::from_slice(nonce), payload)
             .map_err(|_| anyhow!("failed to encrypt direct udp packet")),
         SessionCrypto::Aes256(cipher) => cipher
             .encrypt(Nonce::from_slice(nonce), payload)
             .map_err(|_| anyhow!("failed to encrypt direct udp packet")),
-        SessionCrypto::Raw => Ok(payload.to_vec()),
     }
 }
 
 fn decrypt_direct_payload(
     token: &str,
     transport: Transport,
+    key_rounds: u8,
     nonce: &[u8],
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     if nonce.len() != AES_NONCE_LEN {
         bail!("invalid direct udp nonce length");
     }
-    match direct_crypto(token, transport)? {
+    match direct_crypto(token, transport, key_rounds)? {
         SessionCrypto::Aes128(cipher) => cipher
             .decrypt(Nonce::from_slice(nonce), payload)
             .map_err(|_| anyhow!("failed to decrypt direct udp packet")),
         SessionCrypto::Aes256(cipher) => cipher
             .decrypt(Nonce::from_slice(nonce), payload)
             .map_err(|_| anyhow!("failed to decrypt direct udp packet")),
-        SessionCrypto::Raw => Ok(payload.to_vec()),
     }
 }
 
-fn direct_crypto(token: &str, transport: Transport) -> Result<SessionCrypto> {
+fn direct_crypto(token: &str, transport: Transport, key_rounds: u8) -> Result<SessionCrypto> {
     match transport {
-        Transport::Raw => Ok(SessionCrypto::Raw),
+        Transport::Raw => {
+            let mut key = [0u8; 32];
+            let token_key = token_round_key(token, key_rounds);
+            Hkdf::<Sha256>::new(None, &token_key)
+                .expand(b"erp-direct-udp-raw-aes-256-gcm-v2", &mut key)
+                .map_err(|_| anyhow!("failed to derive direct udp key"))?;
+            Ok(SessionCrypto::Aes256(Box::new(
+                Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid aes key"))?,
+            )))
+        }
         Transport::Aes128Gcm => {
             let mut key = [0u8; 16];
-            Hkdf::<Sha256>::new(None, token.as_bytes())
+            let token_key = token_round_key(token, key_rounds);
+            Hkdf::<Sha256>::new(None, &token_key)
                 .expand(b"erp-direct-udp-aes-128-gcm-v1", &mut key)
                 .map_err(|_| anyhow!("failed to derive direct udp key"))?;
             Ok(SessionCrypto::Aes128(Box::new(
@@ -1628,7 +1778,8 @@ fn direct_crypto(token: &str, transport: Transport) -> Result<SessionCrypto> {
         }
         Transport::Aes256Gcm => {
             let mut key = [0u8; 32];
-            Hkdf::<Sha256>::new(None, token.as_bytes())
+            let token_key = token_round_key(token, key_rounds);
+            Hkdf::<Sha256>::new(None, &token_key)
                 .expand(b"erp-direct-udp-aes-256-gcm-v1", &mut key)
                 .map_err(|_| anyhow!("failed to derive direct udp key"))?;
             Ok(SessionCrypto::Aes256(Box::new(
@@ -1641,25 +1792,23 @@ fn direct_crypto(token: &str, transport: Transport) -> Result<SessionCrypto> {
     }
 }
 
-fn crypto_transport(crypto: &SessionCrypto) -> Transport {
-    match crypto {
-        SessionCrypto::Raw => Transport::Raw,
-        SessionCrypto::Aes128(_) => Transport::Aes128Gcm,
-        SessionCrypto::Aes256(_) => Transport::Aes256Gcm,
-    }
-}
-
 fn verify_direct_hello(
     token: &str,
+    key_rounds: u8,
     client_id: &str,
     remote_port: u16,
-    timestamp: u64,
-    nonce: &[u8],
-    proof: &[u8],
+    auth: DirectProofRef<'_>,
 ) -> Result<()> {
-    verify_timestamp(timestamp)?;
-    let expected = direct_hello_proof(token, client_id, remote_port, timestamp, nonce)?;
-    if expected.ct_eq(proof).into() {
+    verify_timestamp(auth.timestamp)?;
+    let expected = direct_hello_proof(
+        token,
+        key_rounds,
+        client_id,
+        remote_port,
+        auth.timestamp,
+        auth.nonce,
+    )?;
+    if expected.ct_eq(auth.proof).into() {
         Ok(())
     } else {
         bail!("invalid direct udp hello proof")
@@ -1668,16 +1817,23 @@ fn verify_direct_hello(
 
 fn verify_direct_packet(
     token: &str,
+    key_rounds: u8,
     remote_port: u16,
     peer: SocketAddr,
     payload: &[u8],
-    timestamp: u64,
-    nonce: &[u8],
-    proof: &[u8],
+    auth: DirectProofRef<'_>,
 ) -> Result<()> {
-    verify_timestamp(timestamp)?;
-    let expected = direct_packet_proof(token, remote_port, peer, payload, timestamp, nonce)?;
-    if expected.ct_eq(proof).into() {
+    verify_timestamp(auth.timestamp)?;
+    let expected = direct_packet_proof(
+        token,
+        key_rounds,
+        remote_port,
+        peer,
+        payload,
+        auth.timestamp,
+        auth.nonce,
+    )?;
+    if expected.ct_eq(auth.proof).into() {
         Ok(())
     } else {
         bail!("invalid direct udp packet proof")
@@ -1686,14 +1842,17 @@ fn verify_direct_packet(
 
 fn direct_hello_proof(
     token: &str,
+    key_rounds: u8,
     client_id: &str,
     remote_port: u16,
     timestamp: u64,
     nonce: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(token.as_bytes())
-        .map_err(|_| anyhow!("invalid hmac key"))?;
-    mac.update(b"erp-direct-hello-v1");
+    let key = token_round_key(token, key_rounds);
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(&key).map_err(|_| anyhow!("invalid hmac key"))?;
+    mac.update(b"erp-direct-hello-v2");
+    mac.update(&[key_rounds]);
     mac.update(client_id.as_bytes());
     mac.update(&remote_port.to_be_bytes());
     mac.update(&timestamp.to_be_bytes());
@@ -1703,15 +1862,18 @@ fn direct_hello_proof(
 
 fn direct_packet_proof(
     token: &str,
+    key_rounds: u8,
     remote_port: u16,
     peer: SocketAddr,
     payload: &[u8],
     timestamp: u64,
     nonce: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(token.as_bytes())
-        .map_err(|_| anyhow!("invalid hmac key"))?;
-    mac.update(b"erp-direct-packet-v1");
+    let key = token_round_key(token, key_rounds);
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(&key).map_err(|_| anyhow!("invalid hmac key"))?;
+    mac.update(b"erp-direct-packet-v2");
+    mac.update(&[key_rounds]);
     mac.update(&remote_port.to_be_bytes());
     mac.update(peer.to_string().as_bytes());
     mac.update(&timestamp.to_be_bytes());
@@ -1748,6 +1910,12 @@ fn random_nonce_32() -> Vec<u8> {
     let mut nonce = vec![0u8; 32];
     OsRng.fill_bytes(&mut nonce);
     nonce
+}
+
+fn random_key_rounds() -> u8 {
+    let mut byte = [0u8; 1];
+    OsRng.fill_bytes(&mut byte);
+    byte[0].max(1)
 }
 
 async fn read_frame<R>(reader: &mut R) -> Result<Frame>
@@ -1859,18 +2027,22 @@ remote_port = 18080
     fn auth_proof_depends_on_token() {
         let server_nonce = b"server-nonce";
         let client_nonce = b"client-nonce";
-        let good = auth_proof("secret", "client-a", server_nonce, client_nonce, 42).unwrap();
-        let same = auth_proof("secret", "client-a", server_nonce, client_nonce, 42).unwrap();
-        let bad = auth_proof("other", "client-a", server_nonce, client_nonce, 42).unwrap();
+        let good = auth_proof("secret", 7, "client-a", server_nonce, client_nonce, 42).unwrap();
+        let same = auth_proof("secret", 7, "client-a", server_nonce, client_nonce, 42).unwrap();
+        let bad = auth_proof("other", 7, "client-a", server_nonce, client_nonce, 42).unwrap();
+        let bad_rounds =
+            auth_proof("secret", 8, "client-a", server_nonce, client_nonce, 42).unwrap();
 
         assert_eq!(good, same);
         assert_ne!(good, bad);
+        assert_ne!(good, bad_rounds);
     }
 
     #[test]
     fn direct_udp_hello_and_packet_verify() {
         let hello = make_direct_hello("secret", Transport::Raw, "client-a", 18080).unwrap();
         let UdpDatagram::Hello {
+            key_rounds,
             client_id,
             remote_port,
             timestamp,
@@ -1880,12 +2052,25 @@ remote_port = 18080
         else {
             panic!("expected hello datagram");
         };
-        verify_direct_hello("secret", &client_id, remote_port, timestamp, &nonce, &proof).unwrap();
+        verify_direct_hello(
+            "secret",
+            key_rounds,
+            &client_id,
+            remote_port,
+            DirectProofRef {
+                timestamp,
+                nonce: &nonce,
+                proof: &proof,
+            },
+        )
+        .unwrap();
 
         let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
         let packet =
             make_direct_packet("secret", Transport::Raw, 18080, peer, b"ping".to_vec()).unwrap();
+        assert!(!packet.windows(4).any(|window| window == b"ping"));
         let UdpDatagram::Packet {
+            key_rounds,
             remote_port,
             peer,
             payload,
@@ -1898,12 +2083,15 @@ remote_port = 18080
         };
         verify_direct_packet(
             "secret",
+            key_rounds,
             remote_port,
             peer,
             &payload,
-            timestamp,
-            &nonce,
-            &proof,
+            DirectProofRef {
+                timestamp,
+                nonce: &nonce,
+                proof: &proof,
+            },
         )
         .unwrap();
     }
@@ -1953,7 +2141,7 @@ remote_port = 18080
     #[tokio::test]
     async fn aes_session_frame_hides_error_text() {
         let crypto =
-            derive_session_crypto(Transport::Aes256Gcm, "secret", b"server", b"client").unwrap();
+            derive_session_crypto(Transport::Aes256Gcm, "secret", 7, b"server", b"client").unwrap();
         let (mut a, mut b) = duplex(2048);
         let writer_crypto = crypto.clone();
         let writer = tokio::spawn(async move {
@@ -1978,6 +2166,54 @@ remote_port = 18080
         let frame: Frame = bincode::deserialize(&decrypted).unwrap();
         match frame {
             Frame::RegisterFailed { message } => assert!(message.contains("8080")),
+            _ => panic!("unexpected frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_session_frame_hides_registration_details() {
+        let crypto =
+            derive_session_crypto(Transport::Raw, "secret", 9, b"server", b"client").unwrap();
+        let mappings = vec![
+            MappingConfig {
+                name: "socks5-tcp".to_string(),
+                protocol: Protocol::Tcp,
+                local_addr: "127.0.0.1:1080".to_string(),
+                remote_port: 18080,
+                udp_mode: None,
+            },
+            MappingConfig {
+                name: "socks5-udp".to_string(),
+                protocol: Protocol::Udp,
+                local_addr: "127.0.0.1:1080".to_string(),
+                remote_port: 18080,
+                udp_mode: Some(UdpMode::OverTcp),
+            },
+        ];
+        let (mut a, mut b) = duplex(4096);
+        let writer_crypto = crypto.clone();
+        let writer = tokio::spawn(async move {
+            let mut counter = 0;
+            write_session_frame(
+                &mut a,
+                &writer_crypto,
+                Direction::ClientToServer,
+                &mut counter,
+                &Frame::Register { mappings },
+            )
+            .await
+            .unwrap();
+        });
+
+        let raw = read_payload(&mut b).await.unwrap();
+        writer.await.unwrap();
+        assert!(!raw.windows(10).any(|window| window == b"socks5-tcp"));
+        assert!(!raw.windows(10).any(|window| window == b"socks5-udp"));
+        assert!(!raw.windows(14).any(|window| window == b"127.0.0.1:1080"));
+        let decrypted = decrypt_payload(&crypto, Direction::ClientToServer, 0, &raw).unwrap();
+        let frame: Frame = bincode::deserialize(&decrypted).unwrap();
+        match frame {
+            Frame::Register { mappings } => assert_eq!(mappings.len(), 2),
             _ => panic!("unexpected frame"),
         }
     }

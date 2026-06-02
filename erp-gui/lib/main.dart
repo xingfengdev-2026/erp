@@ -129,6 +129,7 @@ class _HomePageState extends State<HomePage> {
     } catch (error) {
       _log('connect failed: $error');
       _desiredProfile = null;
+      _stopping = false;
       _reconnectTimer?.cancel();
       await _socks.stop();
       await _bridge.stopClient();
@@ -201,7 +202,9 @@ class _HomePageState extends State<HomePage> {
         );
       }
       await _bridge.startClient(profile);
+      _reconnectAttempts = 0;
       if (mounted) setState(() => _runningProfileId = profile.id);
+      _log('reconnected ${profile.name}');
     } catch (error) {
       _log('reconnect failed: $error');
       await _handleBridgeExit();

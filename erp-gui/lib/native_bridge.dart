@@ -13,6 +13,8 @@ class NativeErpBridge {
 
   final _events = StreamController<String>.broadcast();
   Process? _process;
+  var _runId = 0;
+  int? _stoppingRunId;
 
   ErpRuntimeState state = ErpRuntimeState.stopped;
   Stream<String> get events => _events.stream;
@@ -23,24 +25,28 @@ class NativeErpBridge {
     final configFile = await _writeTempConfig(profile);
     final executable = await _resolveExecutable();
     final ready = Completer<void>();
-    _process = await Process.start(executable, [
+    var registered = false;
+    final process = await Process.start(executable, [
       'client',
       '--config',
       configFile.path,
     ]);
+    final runId = ++_runId;
+    _process = process;
     state = ErpRuntimeState.running;
     _events.add('erp client started: ${configFile.path}');
     _streamLines(
-      _process!.stdout,
+      process.stdout,
       'erp',
       onLine: (line) {
         if (line.trim() == 'client registered' && !ready.isCompleted) {
+          registered = true;
           ready.complete();
         }
       },
     );
-    _streamLines(_process!.stderr, 'erp');
-    final exitFuture = _process!.exitCode.then((code) {
+    _streamLines(process.stderr, 'erp');
+    final exitFuture = process.exitCode.then((code) {
       if (!ready.isCompleted) {
         ready.completeError(
           StateError('erp client exited before registration'),
@@ -50,9 +56,22 @@ class NativeErpBridge {
     });
     unawaited(
       exitFuture.then((code) {
-        state = ErpRuntimeState.stopped;
-        _process = null;
-        _events.add('erp client exited with code $code');
+        final intentional = _stoppingRunId == runId;
+        if (_process == process) {
+          state = ErpRuntimeState.stopped;
+          _process = null;
+        }
+        if (_stoppingRunId == runId) {
+          _stoppingRunId = null;
+        }
+        if (!registered) return;
+        if (intentional) {
+          _events.add('erp client stopped');
+          return;
+        }
+        if (_process == null || _runId == runId) {
+          _events.add('erp client exited with code $code');
+        }
       }),
     );
     try {
@@ -67,7 +86,11 @@ class NativeErpBridge {
   }
 
   Future<void> stopClient() async {
-    _process?.kill();
+    final process = _process;
+    if (process != null) {
+      _stoppingRunId = _runId;
+      process.kill();
+    }
     _process = null;
     state = ErpRuntimeState.stopped;
   }
