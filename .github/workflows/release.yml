@@ -18,7 +18,7 @@ jobs:
             target: x86_64-unknown-linux-musl
             bin: erp
             artifact: erp-x86_64-unknown-linux-musl
-          - os: windows-latest
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             bin: erp.exe
             artifact: erp-x86_64-pc-windows-msvc.exe
@@ -91,7 +91,7 @@ jobs:
           files: dist/erp-gui-*.apk
 
   gui-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
