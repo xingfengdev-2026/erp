@@ -3,14 +3,18 @@ import 'package:erp_gui/share_codec.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('plain erp link round trips profile without passphrase', () async {
+  test('default erp link round trips profile without passphrase', () async {
     final codec = ShareCodec();
     final profile = ErpProfile.starter();
 
-    final link = codec.encodePlain(profile);
+    final link = await codec.encodePlain(profile);
     final decoded = await codec.decode(link);
 
-    expect(link, startsWith('erp://import?plain='));
+    expect(link, startsWith('erp://import?payload='));
+    expect(link, isNot(contains('Android')));
+    expect(link, isNot(contains('android-phone')));
+    expect(link, isNot(contains('127.0.0.1')));
+    expect(link, isNot(contains('1080')));
     expect(decoded.name, profile.name);
     expect(
       decoded.primaryMapping.remotePort,

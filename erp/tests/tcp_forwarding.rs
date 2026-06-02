@@ -121,6 +121,61 @@ remote_port = {remote_port}
     (path_string(&server_config), path_string(&client_config))
 }
 
+fn write_shared_protocol_configs(
+    dir: &TempDir,
+    control_port: u16,
+    local_tcp_port: u16,
+    local_udp_port: u16,
+    remote_port: u16,
+) -> (String, String) {
+    let server_config = dir.path().join("server.toml");
+    let client_config = dir.path().join("client.toml");
+    std::fs::write(
+        &server_config,
+        format!(
+            r#"
+role = "server"
+token = "secret"
+transport = "raw"
+
+[server]
+bind_addr = "127.0.0.1"
+control_port = {control_port}
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &client_config,
+        format!(
+            r#"
+role = "client"
+token = "secret"
+transport = "raw"
+
+[client]
+server_addr = "127.0.0.1:{control_port}"
+client_id = "it"
+
+[[client.mappings]]
+name = "echo-tcp"
+protocol = "tcp"
+local_addr = "127.0.0.1:{local_tcp_port}"
+remote_port = {remote_port}
+
+[[client.mappings]]
+name = "echo-udp"
+protocol = "udp"
+local_addr = "127.0.0.1:{local_udp_port}"
+remote_port = {remote_port}
+udp_mode = "over_tcp"
+"#
+        ),
+    )
+    .unwrap();
+    (path_string(&server_config), path_string(&client_config))
+}
+
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -199,5 +254,41 @@ async fn remote_port_is_reusable_after_client_disconnect() {
     assert_eq!(&buf, b"again");
 
     let _ = second_client.kill().await;
+    let _ = server.kill().await;
+}
+
+#[tokio::test]
+async fn tcp_and_udp_can_share_remote_port() {
+    let control_port = free_port();
+    let local_tcp_port = free_port();
+    let local_udp_port = free_port();
+    let remote_port = free_port();
+    let dir = TempDir::new().unwrap();
+    let (server_config, client_config) = write_shared_protocol_configs(
+        &dir,
+        control_port,
+        local_tcp_port,
+        local_udp_port,
+        remote_port,
+    );
+
+    tokio::spawn(start_echo(format!("127.0.0.1:{local_tcp_port}")));
+    wait_for_tcp(&format!("127.0.0.1:{local_tcp_port}")).await;
+
+    let mut server = spawn_erp(&["server", "--config", &server_config]);
+    wait_for_tcp(&format!("127.0.0.1:{control_port}")).await;
+
+    let mut client = spawn_erp(&["client", "--config", &client_config]);
+    wait_for_tcp(&format!("127.0.0.1:{remote_port}")).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{remote_port}"))
+        .await
+        .unwrap();
+    stream.write_all(b"shared").await.unwrap();
+    let mut buf = [0u8; 6];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"shared");
+
+    let _ = client.kill().await;
     let _ = server.kill().await;
 }

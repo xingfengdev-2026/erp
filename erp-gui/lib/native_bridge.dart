@@ -22,6 +22,7 @@ class NativeErpBridge {
 
     final configFile = await _writeTempConfig(profile);
     final executable = await _resolveExecutable();
+    final ready = Completer<void>();
     _process = await Process.start(executable, [
       'client',
       '--config',
@@ -29,15 +30,40 @@ class NativeErpBridge {
     ]);
     state = ErpRuntimeState.running;
     _events.add('erp client started: ${configFile.path}');
-    _streamLines(_process!.stdout, 'erp');
+    _streamLines(
+      _process!.stdout,
+      'erp',
+      onLine: (line) {
+        if (line.trim() == 'client registered' && !ready.isCompleted) {
+          ready.complete();
+        }
+      },
+    );
     _streamLines(_process!.stderr, 'erp');
+    final exitFuture = _process!.exitCode.then((code) {
+      if (!ready.isCompleted) {
+        ready.completeError(
+          StateError('erp client exited before registration'),
+        );
+      }
+      return code;
+    });
     unawaited(
-      _process!.exitCode.then((code) {
+      exitFuture.then((code) {
         state = ErpRuntimeState.stopped;
         _process = null;
         _events.add('erp client exited with code $code');
       }),
     );
+    try {
+      await ready.future.timeout(
+        const Duration(seconds: 12),
+        onTimeout: () => throw TimeoutException('erp registration timed out'),
+      );
+    } catch (_) {
+      await stopClient();
+      rethrow;
+    }
   }
 
   Future<void> stopClient() async {
@@ -62,7 +88,7 @@ class NativeErpBridge {
       ..writeln('client_id = "${_escape(profile.clientId)}"')
       ..writeln();
 
-    for (final mapping in profile.mappings) {
+    for (final mapping in _runtimeMappings(profile)) {
       buffer
         ..writeln('[[client.mappings]]')
         ..writeln('name = "${_escape(mapping.name)}"')
@@ -75,6 +101,26 @@ class NativeErpBridge {
       buffer.writeln();
     }
     return buffer.toString();
+  }
+
+  List<ErpMapping> _runtimeMappings(ErpProfile profile) {
+    if (!profile.exposesSocks5) return profile.mappings;
+    final mapping = profile.primaryMapping;
+    return [
+      ErpMapping(
+        name: 'socks5-tcp',
+        protocol: ErpProtocol.tcp,
+        localAddr: mapping.localAddr,
+        remotePort: mapping.remotePort,
+      ),
+      ErpMapping(
+        name: 'socks5-udp',
+        protocol: ErpProtocol.udp,
+        localAddr: mapping.localAddr,
+        remotePort: mapping.remotePort,
+        udpMode: ErpUdpMode.overTcp,
+      ),
+    ];
   }
 
   Future<File> _writeTempConfig(ErpProfile profile) async {
@@ -104,11 +150,18 @@ class NativeErpBridge {
   String _escape(String value) =>
       value.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
 
-  void _streamLines(Stream<List<int>> stream, String prefix) {
+  void _streamLines(
+    Stream<List<int>> stream,
+    String prefix, {
+    void Function(String line)? onLine,
+  }) {
     stream.transform(utf8.decoder).transform(const LineSplitter()).listen((
       line,
     ) {
-      if (line.trim().isNotEmpty) _events.add('$prefix: $line');
+      if (line.trim().isNotEmpty) {
+        _events.add('$prefix: $line');
+        onLine?.call(line);
+      }
     });
   }
 }

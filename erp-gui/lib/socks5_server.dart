@@ -5,17 +5,20 @@ import 'dart:typed_data';
 class Socks5Server {
   ServerSocket? _tcpServer;
   RawDatagramSocket? _udpRelay;
+  StreamSubscription<RawSocketEvent>? _udpSub;
   final _sockets = <Socket>{};
   final _pipeSubs = <StreamSubscription<List<int>>>{};
   final _events = StreamController<String>.broadcast();
+  int? _advertisedUdpPort;
 
   Stream<String> get events => _events.stream;
   bool get running => _tcpServer != null;
   int? get tcpPort => _tcpServer?.port;
   int? get udpPort => _udpRelay?.port;
 
-  Future<void> start({required int port}) async {
+  Future<void> start({required int port, int? advertisedUdpPort}) async {
     if (running) return;
+    _advertisedUdpPort = advertisedUdpPort;
     _tcpServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, port);
     _events.add('SOCKS5 listening on 127.0.0.1:${_tcpServer!.port}');
     _tcpServer!.listen(
@@ -29,8 +32,11 @@ class Socks5Server {
   Future<void> stop() async {
     await _tcpServer?.close();
     _tcpServer = null;
+    await _udpSub?.cancel();
+    _udpSub = null;
     _udpRelay?.close();
     _udpRelay = null;
+    _advertisedUdpPort = null;
     for (final sub in _pipeSubs.toList()) {
       await sub.cancel();
     }
@@ -109,15 +115,26 @@ class Socks5Server {
   }
 
   Future<void> _udpAssociate(Socket client) async {
-    _udpRelay ??= await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
-    _udpRelay!.listen((event) {
+    await _ensureUdpRelay();
+    final replyPort = _advertisedUdpPort ?? _udpRelay!.port;
+    _reply(client, 0x00, port: replyPort);
+    _events.add('UDP ASSOCIATE on 127.0.0.1:${_udpRelay!.port}');
+    await client.done;
+  }
+
+  Future<void> _ensureUdpRelay() async {
+    if (_udpRelay != null) return;
+    final port = _tcpServer?.port ?? 0;
+    _udpRelay = await RawDatagramSocket.bind(
+      InternetAddress.loopbackIPv4,
+      port,
+    );
+    _udpSub = _udpRelay!.listen((event) {
       if (event != RawSocketEvent.read) return;
       final datagram = _udpRelay!.receive();
       if (datagram == null) return;
       _handleUdpDatagram(datagram);
     });
-    _reply(client, 0x00, port: _udpRelay!.port);
-    _events.add('UDP ASSOCIATE on 127.0.0.1:${_udpRelay!.port}');
   }
 
   Future<void> _handleUdpDatagram(Datagram datagram) async {
@@ -132,19 +149,25 @@ class Socks5Server {
     final port = (data[offset] << 8) | data[offset + 1];
     offset += 2;
     try {
-      final remote = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-      remote.send(data.sublist(offset), InternetAddress(parsed.host), port);
+      final target = await _resolve(parsed.host);
+      final bindAddress = target.type == InternetAddressType.IPv6
+          ? InternetAddress.anyIPv6
+          : InternetAddress.anyIPv4;
+      final remote = await RawDatagramSocket.bind(bindAddress, 0);
+      remote.send(data.sublist(offset), target, port);
       late StreamSubscription sub;
       sub = remote.listen((event) {
         if (event != RawSocketEvent.read) return;
         final response = remote.receive();
         if (response == null) return;
+        final responseAddress = response.address.rawAddress;
+        final responseAtyp = responseAddress.length == 16 ? 0x04 : 0x01;
         final packet = <int>[
           0,
           0,
           0,
-          1,
-          ...response.address.rawAddress,
+          responseAtyp,
+          ...responseAddress,
           (response.port >> 8) & 0xff,
           response.port & 0xff,
           ...response.data,
@@ -193,7 +216,23 @@ class Socks5Server {
         offset + len,
       );
     }
+    if (atyp == 0x04 && data.length >= offset + 16) {
+      final host = InternetAddress.fromRawAddress(
+        data.sublist(offset, offset + 16),
+      ).address;
+      return _UdpAddress(host, offset + 16);
+    }
     return null;
+  }
+
+  Future<InternetAddress> _resolve(String host) async {
+    final literal = InternetAddress.tryParse(host);
+    if (literal != null) return literal;
+    final addresses = await InternetAddress.lookup(host);
+    return addresses.firstWhere(
+      (address) => address.type == InternetAddressType.IPv4,
+      orElse: () => addresses.first,
+    );
   }
 
   void _reply(Socket socket, int code, {int port = 0}) {

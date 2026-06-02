@@ -65,6 +65,12 @@ class _HomePageState extends State<HomePage> {
   var _loading = true;
   var _busy = false;
   String? _runningProfileId;
+  ErpProfile? _desiredProfile;
+  Timer? _reconnectTimer;
+  var _reconnectAttempts = 0;
+  var _stopping = false;
+
+  static const _maxReconnectAttempts = 3;
 
   ErpProfile get _profile => _profiles[_selectedIndex];
   bool get _running => _runningProfileId != null;
@@ -77,8 +83,7 @@ class _HomePageState extends State<HomePage> {
     _bridgeSub = _bridge.events.listen((message) {
       _log(message);
       if (message.startsWith('erp client exited') && mounted) {
-        unawaited(_socks.stop());
-        setState(() => _runningProfileId = null);
+        unawaited(_handleBridgeExit());
       }
     });
   }
@@ -87,6 +92,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _socksSub?.cancel();
     _bridgeSub?.cancel();
+    _reconnectTimer?.cancel();
     unawaited(_socks.stop());
     unawaited(_bridge.dispose());
     super.dispose();
@@ -122,6 +128,8 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (error) {
       _log('connect failed: $error');
+      _desiredProfile = null;
+      _reconnectTimer?.cancel();
       await _socks.stop();
       await _bridge.stopClient();
       if (mounted) setState(() => _runningProfileId = null);
@@ -131,9 +139,16 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _startRuntime(ErpProfile profile) async {
+    _reconnectTimer?.cancel();
+    _desiredProfile = profile;
+    _stopping = false;
+    _reconnectAttempts = 0;
     if (profile.exposesSocks5) {
       await _socks.stop();
-      await _socks.start(port: profile.localPort);
+      await _socks.start(
+        port: profile.localPort,
+        advertisedUdpPort: profile.primaryMapping.remotePort,
+      );
     }
     await _bridge.startClient(profile);
     setState(() => _runningProfileId = profile.id);
@@ -141,10 +156,56 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _stopRuntime() async {
+    _stopping = true;
+    _desiredProfile = null;
+    _reconnectTimer?.cancel();
     await _bridge.stopClient();
     await _socks.stop();
     setState(() => _runningProfileId = null);
+    _stopping = false;
     _log('disconnected');
+  }
+
+  Future<void> _handleBridgeExit() async {
+    if (_stopping || _desiredProfile == null) {
+      await _socks.stop();
+      if (mounted) setState(() => _runningProfileId = null);
+      return;
+    }
+    if (_reconnectAttempts >= _maxReconnectAttempts) {
+      _log('erp reconnect stopped after $_maxReconnectAttempts attempts');
+      _desiredProfile = null;
+      await _socks.stop();
+      if (mounted) setState(() => _runningProfileId = null);
+      return;
+    }
+
+    final profile = _desiredProfile!;
+    _reconnectAttempts += 1;
+    _log(
+      'erp exited; reconnecting ($_reconnectAttempts/$_maxReconnectAttempts)',
+    );
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 2), () {
+      unawaited(_restartBridge(profile));
+    });
+  }
+
+  Future<void> _restartBridge(ErpProfile profile) async {
+    if (!mounted || _desiredProfile?.id != profile.id) return;
+    try {
+      if (profile.exposesSocks5 && !_socks.running) {
+        await _socks.start(
+          port: profile.localPort,
+          advertisedUdpPort: profile.primaryMapping.remotePort,
+        );
+      }
+      await _bridge.startClient(profile);
+      if (mounted) setState(() => _runningProfileId = profile.id);
+    } catch (error) {
+      _log('reconnect failed: $error');
+      await _handleBridgeExit();
+    }
   }
 
   Future<void> _addProfile() async {
@@ -191,85 +252,44 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _showShare(ErpProfile profile) async {
-    var encrypted = false;
-    var link = _share.encodePlain(profile);
-    final passController = TextEditingController();
+    late final String link;
+    try {
+      link = await _share.encodePlain(profile);
+    } catch (error) {
+      _log('share failed: $error');
+      return;
+    }
+    if (!mounted) return;
 
     await showDialog<void>(
       context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          final messenger = ScaffoldMessenger.of(dialogContext);
-          Future<void> rebuildLink() async {
-            try {
-              final next = encrypted
-                  ? await _share.encodeEncrypted(profile, passController.text)
-                  : _share.encodePlain(profile);
-              setDialogState(() => link = next);
-            } catch (error) {
-              messenger.showSnackBar(
-                SnackBar(content: Text('Share failed: $error')),
-              );
-            }
-          }
-
-          return AlertDialog(
-            title: Text('Share ${profile.name}'),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  SegmentedButton<bool>(
-                    segments: const [
-                      ButtonSegment(value: false, label: Text('Plain')),
-                      ButtonSegment(value: true, label: Text('Encrypted')),
-                    ],
-                    selected: {encrypted},
-                    onSelectionChanged: (values) async {
-                      encrypted = values.first;
-                      await rebuildLink();
-                    },
-                  ),
-                  if (encrypted) ...[
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: passController,
-                      obscureText: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Passphrase',
-                        border: OutlineInputBorder(),
-                      ),
-                      onChanged: (_) => unawaited(rebuildLink()),
-                    ),
-                  ],
-                  const SizedBox(height: 16),
-                  QrImageView(
-                    data: link,
-                    size: 220,
-                    backgroundColor: Colors.white,
-                  ),
-                  const SizedBox(height: 12),
-                  SelectableText(link),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(dialogContext),
-                child: const Text('Close'),
-              ),
-              FilledButton.icon(
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: link));
-                  Navigator.pop(dialogContext);
-                  _log('share link copied');
-                },
-                icon: const Icon(Icons.copy),
-                label: const Text('Copy'),
-              ),
+      builder: (dialogContext) => AlertDialog(
+        title: Text('Share ${profile.name}'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              QrImageView(data: link, size: 220, backgroundColor: Colors.white),
+              const SizedBox(height: 12),
+              SelectableText(link),
             ],
-          );
-        },
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Close'),
+          ),
+          FilledButton.icon(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: link));
+              Navigator.pop(dialogContext);
+              _log('share link copied');
+            },
+            icon: const Icon(Icons.copy),
+            label: const Text('Copy'),
+          ),
+        ],
       ),
     );
   }
@@ -298,7 +318,7 @@ class _HomePageState extends State<HomePage> {
               controller: passController,
               obscureText: true,
               decoration: const InputDecoration(
-                labelText: 'Passphrase if encrypted',
+                labelText: 'Legacy passphrase (optional)',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -467,8 +487,9 @@ class _ConfigTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final mapping = profile.primaryMapping;
-    final udp = mapping.udpMode == null ? '' : ' / ${mapping.udpMode!.wire}';
+    final summaries = profile.exposesSocks5
+        ? [_socks5Summary(profile.primaryMapping)]
+        : profile.mappings.map(_mappingSummary).toList();
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 5),
       color: selected ? scheme.secondaryContainer : null,
@@ -476,79 +497,100 @@ class _ConfigTile extends StatelessWidget {
         onTap: onTap,
         borderRadius: BorderRadius.circular(8),
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
-          child: Row(
+          padding: const EdgeInsets.fromLTRB(12, 10, 8, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(
-                running
-                    ? Icons.cloud_done
-                    : selected
-                    ? Icons.radio_button_checked
-                    : Icons.radio_button_unchecked,
-                color: running || selected ? scheme.primary : scheme.outline,
+              Row(
+                children: [
+                  Icon(
+                    running
+                        ? Icons.cloud_done
+                        : selected
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_unchecked,
+                    color: running || selected
+                        ? scheme.primary
+                        : scheme.outline,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      profile.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _KindChip(label: profile.kind.label),
+                ],
               ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            profile.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleMedium
-                                ?.copyWith(fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        _KindChip(label: profile.kind.label),
-                      ],
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      profile.serverAddr,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      '${mapping.localAddr} -> :${mapping.remotePort}  ${mapping.protocol.wire}$udp',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                    Text(
+              const SizedBox(height: 6),
+              Text(
+                profile.serverAddr,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 2),
+              for (final summary in summaries.take(4))
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    summary,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+              if (summaries.length > 4)
+                Text(
+                  '+${summaries.length - 4} more forwards',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
                       '${profile.clientId} / ${profile.transport.wire}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
-                  ],
-                ),
-              ),
-              IconButton(
-                tooltip: 'Share',
-                onPressed: onShare,
-                icon: const Icon(Icons.qr_code_2),
-              ),
-              IconButton(
-                tooltip: 'Edit',
-                onPressed: onEdit,
-                icon: const Icon(Icons.edit_outlined),
-              ),
-              IconButton(
-                tooltip: 'Delete',
-                onPressed: onDelete,
-                icon: const Icon(Icons.delete_outline),
+                  ),
+                  IconButton(
+                    tooltip: 'Share',
+                    onPressed: onShare,
+                    icon: const Icon(Icons.qr_code_2),
+                  ),
+                  IconButton(
+                    tooltip: 'Edit',
+                    onPressed: onEdit,
+                    icon: const Icon(Icons.edit_outlined),
+                  ),
+                  IconButton(
+                    tooltip: 'Delete',
+                    onPressed: onDelete,
+                    icon: const Icon(Icons.delete_outline),
+                  ),
+                ],
               ),
             ],
           ),
         ),
       ),
     );
+  }
+
+  static String _socks5Summary(ErpMapping mapping) =>
+      'SOCKS5 ${mapping.localAddr} -> :${mapping.remotePort}  tcp/udp';
+
+  static String _mappingSummary(ErpMapping mapping) {
+    final udp = mapping.udpMode == null ? '' : ' / ${mapping.udpMode!.wire}';
+    return '${mapping.name}: ${mapping.localAddr} -> :${mapping.remotePort}  ${mapping.protocol.wire}$udp';
   }
 }
 
@@ -621,12 +663,11 @@ class _ConfigEditorDialogState extends State<ConfigEditorDialog> {
   late final TextEditingController serverAddr;
   late final TextEditingController clientId;
   late final TextEditingController token;
-  late final TextEditingController localAddr;
-  late final TextEditingController remotePort;
+  late final TextEditingController socksLocalAddr;
+  late final TextEditingController socksRemotePort;
   late ErpProfileKind kind;
   late ErpTransport transport;
-  late ErpProtocol protocol;
-  late ErpUdpMode udpMode;
+  late List<ErpMapping> mappings;
 
   @override
   void initState() {
@@ -636,12 +677,15 @@ class _ConfigEditorDialogState extends State<ConfigEditorDialog> {
     serverAddr = TextEditingController(text: widget.profile.serverAddr);
     clientId = TextEditingController(text: widget.profile.clientId);
     token = TextEditingController(text: widget.profile.token);
-    localAddr = TextEditingController(text: mapping.localAddr);
-    remotePort = TextEditingController(text: mapping.remotePort.toString());
+    socksLocalAddr = TextEditingController(text: mapping.localAddr);
+    socksRemotePort = TextEditingController(
+      text: mapping.remotePort.toString(),
+    );
     kind = widget.profile.kind;
     transport = widget.profile.transport;
-    protocol = mapping.protocol;
-    udpMode = mapping.udpMode ?? ErpUdpMode.overTcp;
+    mappings = widget.profile.kind == ErpProfileKind.forwarding
+        ? List<ErpMapping>.from(widget.profile.mappings)
+        : [ErpProfile.defaultMapping(ErpProfileKind.forwarding, 1080)];
   }
 
   @override
@@ -650,8 +694,8 @@ class _ConfigEditorDialogState extends State<ConfigEditorDialog> {
     serverAddr.dispose();
     clientId.dispose();
     token.dispose();
-    localAddr.dispose();
-    remotePort.dispose();
+    socksLocalAddr.dispose();
+    socksRemotePort.dispose();
     super.dispose();
   }
 
@@ -664,19 +708,21 @@ class _ConfigEditorDialogState extends State<ConfigEditorDialog> {
           mainAxisSize: MainAxisSize.min,
           children: [
             SegmentedButton<ErpProfileKind>(
-              segments: [
-                for (final value in ErpProfileKind.values)
-                  ButtonSegment(value: value, label: Text(value.label)),
+              segments: const [
+                ButtonSegment(
+                  value: ErpProfileKind.socks5,
+                  icon: Icon(Icons.dns_outlined),
+                  label: Text('SOCKS5'),
+                ),
+                ButtonSegment(
+                  value: ErpProfileKind.forwarding,
+                  icon: Icon(Icons.route_outlined),
+                  label: Text('Forward'),
+                ),
               ],
               selected: {kind},
-              onSelectionChanged: (values) {
-                setState(() {
-                  kind = values.first;
-                  if (kind == ErpProfileKind.socks5) {
-                    protocol = ErpProtocol.tcp;
-                  }
-                });
-              },
+              onSelectionChanged: (values) =>
+                  setState(() => kind = values.first),
             ),
             const SizedBox(height: 12),
             _Field(controller: name, label: 'Name'),
@@ -697,49 +743,20 @@ class _ConfigEditorDialogState extends State<ConfigEditorDialog> {
                   setState(() => transport = value ?? ErpTransport.raw),
             ),
             const SizedBox(height: 10),
-            if (kind == ErpProfileKind.forwarding) ...[
-              DropdownButtonFormField<ErpProtocol>(
-                initialValue: protocol,
-                decoration: const InputDecoration(
-                  labelText: 'Protocol',
-                  border: OutlineInputBorder(),
-                ),
-                items: [
-                  for (final value in ErpProtocol.values)
-                    DropdownMenuItem(value: value, child: Text(value.wire)),
-                ],
-                onChanged: (value) =>
-                    setState(() => protocol = value ?? ErpProtocol.tcp),
+            if (kind == ErpProfileKind.socks5) ...[
+              _Field(controller: socksLocalAddr, label: 'Local SOCKS5 ip:port'),
+              _Field(
+                controller: socksRemotePort,
+                label: 'Remote SOCKS5 port',
+                keyboardType: TextInputType.number,
               ),
-              const SizedBox(height: 10),
-            ],
-            if (protocol == ErpProtocol.udp) ...[
-              DropdownButtonFormField<ErpUdpMode>(
-                initialValue: udpMode,
-                decoration: const InputDecoration(
-                  labelText: 'UDP mode',
-                  border: OutlineInputBorder(),
-                ),
-                items: [
-                  for (final value in ErpUdpMode.values)
-                    DropdownMenuItem(value: value, child: Text(value.wire)),
-                ],
-                onChanged: (value) =>
-                    setState(() => udpMode = value ?? ErpUdpMode.overTcp),
+            ] else
+              _ForwardingRulesEditor(
+                mappings: mappings,
+                onAdd: () => _editMapping(null),
+                onEdit: _editMapping,
+                onDelete: _deleteMapping,
               ),
-              const SizedBox(height: 10),
-            ],
-            _Field(
-              controller: localAddr,
-              label: kind == ErpProfileKind.socks5
-                  ? 'Local SOCKS5 ip:port'
-                  : 'Local ip:port',
-            ),
-            _Field(
-              controller: remotePort,
-              label: 'Remote port',
-              keyboardType: TextInputType.number,
-            ),
           ],
         ),
       ),
@@ -757,16 +774,17 @@ class _ConfigEditorDialogState extends State<ConfigEditorDialog> {
   }
 
   ErpProfile _buildProfile() {
-    final selectedProtocol = kind == ErpProfileKind.socks5
-        ? ErpProtocol.tcp
-        : protocol;
-    final mapping = ErpMapping(
-      name: kind == ErpProfileKind.socks5 ? 'socks5' : name.text.trim(),
-      protocol: selectedProtocol,
-      localAddr: localAddr.text.trim(),
-      remotePort: int.tryParse(remotePort.text.trim()) ?? 18080,
-      udpMode: selectedProtocol == ErpProtocol.udp ? udpMode : null,
+    final socksMapping = ErpMapping(
+      name: 'socks5',
+      protocol: ErpProtocol.tcp,
+      localAddr: socksLocalAddr.text.trim(),
+      remotePort: int.tryParse(socksRemotePort.text.trim()) ?? 18080,
     );
+    final nextMappings = kind == ErpProfileKind.socks5
+        ? [socksMapping]
+        : mappings.isEmpty
+        ? [ErpProfile.defaultMapping(ErpProfileKind.forwarding, 1080)]
+        : mappings;
     return widget.profile.copyWith(
       kind: kind,
       name: name.text.trim().isEmpty ? widget.profile.name : name.text.trim(),
@@ -774,10 +792,222 @@ class _ConfigEditorDialogState extends State<ConfigEditorDialog> {
       clientId: clientId.text.trim(),
       token: token.text,
       transport: transport,
-      socks5Port: ErpProfile.parsePort(mapping.localAddr) ?? 1080,
-      mappings: [mapping],
+      socks5Port: ErpProfile.parsePort(socksMapping.localAddr) ?? 1080,
+      mappings: nextMappings,
     );
   }
+
+  Future<void> _editMapping(int? index) async {
+    final initial = index == null
+        ? ErpMapping(
+            name: 'forward-${mappings.length + 1}',
+            protocol: ErpProtocol.tcp,
+            localAddr: '127.0.0.1:8080',
+            remotePort: 18080 + mappings.length,
+          )
+        : mappings[index];
+    final edited = await showDialog<ErpMapping>(
+      context: context,
+      builder: (_) => MappingEditorDialog(mapping: initial),
+    );
+    if (edited == null) return;
+    setState(() {
+      if (index == null) {
+        mappings.add(edited);
+      } else {
+        mappings[index] = edited;
+      }
+    });
+  }
+
+  void _deleteMapping(int index) {
+    setState(() => mappings.removeAt(index));
+  }
+}
+
+class _ForwardingRulesEditor extends StatelessWidget {
+  const _ForwardingRulesEditor({
+    required this.mappings,
+    required this.onAdd,
+    required this.onEdit,
+    required this.onDelete,
+  });
+
+  final List<ErpMapping> mappings;
+  final VoidCallback onAdd;
+  final void Function(int index) onEdit;
+  final void Function(int index) onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Forwarding rules',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+            ),
+            TextButton.icon(
+              onPressed: onAdd,
+              icon: const Icon(Icons.add),
+              label: const Text('Add'),
+            ),
+          ],
+        ),
+        if (mappings.isEmpty)
+          Text(
+            'No forwarding rules. A default TCP rule will be saved.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        for (var i = 0; i < mappings.length; i++)
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: Text(
+              mappings[i].name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            subtitle: Text(
+              _formatMapping(mappings[i]),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  tooltip: 'Edit',
+                  onPressed: () => onEdit(i),
+                  icon: const Icon(Icons.edit_outlined),
+                ),
+                IconButton(
+                  tooltip: 'Delete',
+                  onPressed: () => onDelete(i),
+                  icon: const Icon(Icons.delete_outline),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class MappingEditorDialog extends StatefulWidget {
+  const MappingEditorDialog({super.key, required this.mapping});
+
+  final ErpMapping mapping;
+
+  @override
+  State<MappingEditorDialog> createState() => _MappingEditorDialogState();
+}
+
+class _MappingEditorDialogState extends State<MappingEditorDialog> {
+  late final TextEditingController name;
+  late final TextEditingController localAddr;
+  late final TextEditingController remotePort;
+  late ErpProtocol protocol;
+  late ErpUdpMode udpMode;
+
+  @override
+  void initState() {
+    super.initState();
+    name = TextEditingController(text: widget.mapping.name);
+    localAddr = TextEditingController(text: widget.mapping.localAddr);
+    remotePort = TextEditingController(
+      text: widget.mapping.remotePort.toString(),
+    );
+    protocol = widget.mapping.protocol;
+    udpMode = widget.mapping.udpMode ?? ErpUdpMode.overTcp;
+  }
+
+  @override
+  void dispose() {
+    name.dispose();
+    localAddr.dispose();
+    remotePort.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Forwarding rule'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _Field(controller: name, label: 'Rule name'),
+            DropdownButtonFormField<ErpProtocol>(
+              initialValue: protocol,
+              decoration: const InputDecoration(
+                labelText: 'Protocol',
+                border: OutlineInputBorder(),
+              ),
+              items: [
+                for (final value in ErpProtocol.values)
+                  DropdownMenuItem(value: value, child: Text(value.wire)),
+              ],
+              onChanged: (value) =>
+                  setState(() => protocol = value ?? ErpProtocol.tcp),
+            ),
+            const SizedBox(height: 10),
+            if (protocol == ErpProtocol.udp) ...[
+              DropdownButtonFormField<ErpUdpMode>(
+                initialValue: udpMode,
+                decoration: const InputDecoration(
+                  labelText: 'UDP mode',
+                  border: OutlineInputBorder(),
+                ),
+                items: [
+                  for (final value in ErpUdpMode.values)
+                    DropdownMenuItem(value: value, child: Text(value.wire)),
+                ],
+                onChanged: (value) =>
+                    setState(() => udpMode = value ?? ErpUdpMode.overTcp),
+              ),
+              const SizedBox(height: 10),
+            ],
+            _Field(controller: localAddr, label: 'Local ip:port'),
+            _Field(
+              controller: remotePort,
+              label: 'Remote port',
+              keyboardType: TextInputType.number,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _buildMapping()),
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+
+  ErpMapping _buildMapping() {
+    return ErpMapping(
+      name: name.text.trim().isEmpty ? 'forward' : name.text.trim(),
+      protocol: protocol,
+      localAddr: localAddr.text.trim(),
+      remotePort: int.tryParse(remotePort.text.trim()) ?? 18080,
+      udpMode: protocol == ErpProtocol.udp ? udpMode : null,
+    );
+  }
+}
+
+String _formatMapping(ErpMapping mapping) {
+  final udp = mapping.udpMode == null ? '' : ' / ${mapping.udpMode!.wire}';
+  return '${mapping.localAddr} -> :${mapping.remotePort}  ${mapping.protocol.wire}$udp';
 }
 
 class _Field extends StatelessWidget {

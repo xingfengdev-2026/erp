@@ -74,7 +74,7 @@ enum Transport {
     Tls,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 enum Protocol {
     Tcp,
@@ -626,7 +626,7 @@ struct ClientTunnel {
 
 #[derive(Default)]
 struct ServerState {
-    mappings: Mutex<HashSet<u16>>,
+    mappings: Mutex<HashSet<(Protocol, u16)>>,
     pending: Mutex<HashMap<u64, PendingData>>,
     udp_sockets: Mutex<HashMap<u16, Arc<UdpSocket>>>,
     direct_routes: Mutex<HashMap<u16, SocketAddr>>,
@@ -693,28 +693,34 @@ async fn handle_registration(
     let mut writer = FrameWriter::new(writer_half, crypto.clone(), Direction::ServerToClient, 0);
     let (tx, mut rx) = mpsc::channel::<Frame>(128);
     let mut listener_tasks = Vec::new();
-    let owned_ports = mappings
+    let owned_mappings = mappings
         .iter()
-        .map(|mapping| mapping.remote_port)
+        .map(|mapping| (mapping.protocol, mapping.remote_port))
         .collect::<Vec<_>>();
 
     {
         let mut registered = state.mappings.lock().await;
         for mapping in &mappings {
-            if registered.contains(&mapping.remote_port) {
+            let key = (mapping.protocol, mapping.remote_port);
+            if registered.contains(&key) {
                 writer
                     .write_frame(&Frame::RegisterFailed {
                         message: format!(
-                            "remote port {} is already registered",
+                            "remote {} port {} is already registered",
+                            protocol_name(mapping.protocol),
                             mapping.remote_port
                         ),
                     })
                     .await?;
-                bail!("duplicate remote port {}", mapping.remote_port);
+                bail!(
+                    "duplicate remote {} port {}",
+                    protocol_name(mapping.protocol),
+                    mapping.remote_port
+                );
             }
         }
         for mapping in &mappings {
-            registered.insert(mapping.remote_port);
+            registered.insert((mapping.protocol, mapping.remote_port));
         }
     }
 
@@ -780,32 +786,47 @@ async fn handle_registration(
     for task in listener_tasks {
         task.abort();
     }
-    cleanup_client_ports(&state, &owned_ports).await;
+    cleanup_client_ports(&state, &owned_mappings).await;
     Ok(())
 }
 
-async fn cleanup_client_ports(state: &ServerState, ports: &[u16]) {
-    let owned = ports.iter().copied().collect::<HashSet<_>>();
+async fn cleanup_client_ports(state: &ServerState, mappings: &[(Protocol, u16)]) {
+    let owned_mappings = mappings.iter().copied().collect::<HashSet<_>>();
+    let owned_tcp_ports = mappings
+        .iter()
+        .filter_map(|(protocol, port)| (*protocol == Protocol::Tcp).then_some(*port))
+        .collect::<HashSet<_>>();
+    let owned_udp_ports = mappings
+        .iter()
+        .filter_map(|(protocol, port)| (*protocol == Protocol::Udp).then_some(*port))
+        .collect::<HashSet<_>>();
     state
         .mappings
         .lock()
         .await
-        .retain(|port| !owned.contains(port));
+        .retain(|mapping| !owned_mappings.contains(mapping));
     state
         .udp_sockets
         .lock()
         .await
-        .retain(|port, _| !owned.contains(port));
+        .retain(|port, _| !owned_udp_ports.contains(port));
     state
         .direct_routes
         .lock()
         .await
-        .retain(|port, _| !owned.contains(port));
+        .retain(|port, _| !owned_udp_ports.contains(port));
     state
         .pending
         .lock()
         .await
-        .retain(|_, pending| !owned.contains(&pending.remote_port));
+        .retain(|_, pending| !owned_tcp_ports.contains(&pending.remote_port));
+}
+
+fn protocol_name(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+    }
 }
 
 async fn spawn_tcp_listener(
@@ -1076,7 +1097,10 @@ async fn run_client(config: Config) -> Result<()> {
     )
     .await?
     {
-        Frame::RegisterOk => info!("client registered"),
+        Frame::RegisterOk => {
+            info!("client registered");
+            println!("client registered");
+        }
         Frame::RegisterFailed { message } => bail!("registration failed: {}", message),
         other => bail!("unexpected register response: {:?}", other),
     }
