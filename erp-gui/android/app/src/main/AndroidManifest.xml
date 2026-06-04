@@ -3,7 +3,8 @@
     <application
         android:label="erp"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@drawable/ic_erp_launcher"
+        android:roundIcon="@drawable/ic_erp_launcher"
         android:extractNativeLibs="true">
         <activity
             android:name=".MainActivity"
@@ -30,7 +31,7 @@
                 <action android:name="android.intent.action.VIEW"/>
                 <category android:name="android.intent.category.DEFAULT"/>
                 <category android:name="android.intent.category.BROWSABLE"/>
-                <data android:scheme="erp" android:host="import"/>
+                <data android:scheme="erp" android:host="i"/>
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.

@@ -1,6 +1,6 @@
 [package]
 name = "erp"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 
 [lib]
@@ -19,6 +19,7 @@ libc = "0.2"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+socket2 = "0.5"
 subtle = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"

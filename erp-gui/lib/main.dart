@@ -27,8 +27,22 @@ class ErpGuiApp extends StatelessWidget {
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(seedColor: seed),
         scaffoldBackgroundColor: const Color(0xfff7f8f5),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xfff7f8f5),
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+        ),
         cardTheme: CardThemeData(
           elevation: 0,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+        floatingActionButtonTheme: const FloatingActionButtonThemeData(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(8)),
+          ),
+        ),
+        snackBarTheme: SnackBarThemeData(
+          behavior: SnackBarBehavior.floating,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         ),
       ),
@@ -244,16 +258,40 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _deleteProfile(int index) async {
-    final deletingRunning = _profiles[index].id == _runningProfileId;
+    final removed = _profiles[index];
+    final deletingRunning = removed.id == _runningProfileId;
+    final placeholderId =
+        'undo-placeholder-${DateTime.now().microsecondsSinceEpoch}';
     if (deletingRunning) await _stopRuntime();
     setState(() {
       _profiles.removeAt(index);
       if (_profiles.isEmpty) {
-        _profiles.add(ErpProfile.starter());
+        _profiles.add(ErpProfile.starter().copyWith(id: placeholderId));
       }
       _selectedIndex = _selectedIndex.clamp(0, _profiles.length - 1);
     });
     await _persist();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 3),
+          content: Text('Deleted ${removed.name}'),
+          action: SnackBarAction(
+            label: 'Undo',
+            onPressed: () {
+              setState(() {
+                _profiles.removeWhere((profile) => profile.id == placeholderId);
+                final restoreIndex = index.clamp(0, _profiles.length).toInt();
+                _profiles.insert(restoreIndex, removed);
+                _selectedIndex = restoreIndex;
+              });
+              unawaited(_persist());
+            },
+          ),
+        ),
+      );
   }
 
   Future<void> _showShare(ErpProfile profile) async {
@@ -380,7 +418,15 @@ class _HomePageState extends State<HomePage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('erp'),
+        titleSpacing: 12,
+        title: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _ErpLogo(size: 36),
+            SizedBox(width: 10),
+            Text('erp', style: TextStyle(fontWeight: FontWeight.w800)),
+          ],
+        ),
         actions: [
           IconButton(
             tooltip: 'Add config',
@@ -459,6 +505,36 @@ class _HomePageState extends State<HomePage> {
   }
 }
 
+class _ErpLogo extends StatelessWidget {
+  const _ErpLogo({required this.size});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xff287a6b), Color(0xff34558b)],
+        ),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xff287a6b).withValues(alpha: 0.20),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Icon(Icons.hub_outlined, color: Colors.white, size: size * 0.58),
+    );
+  }
+}
+
 class _StatusBanner extends StatelessWidget {
   const _StatusBanner({
     required this.label,
@@ -473,25 +549,58 @@ class _StatusBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final icon = active ? Icons.cloud_done_outlined : Icons.power_settings_new;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       decoration: BoxDecoration(
         color: active
             ? scheme.primaryContainer
             : scheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: active
+              ? scheme.primary.withValues(alpha: 0.20)
+              : scheme.outlineVariant,
+        ),
       ),
       child: Row(
         children: [
           if (busy)
-            const SizedBox.square(
-              dimension: 22,
-              child: CircularProgressIndicator(strokeWidth: 2),
+            SizedBox.square(
+              dimension: 24,
+              child: CircularProgressIndicator(
+                strokeWidth: 2.4,
+                color: scheme.primary,
+              ),
             )
           else
-            Icon(active ? Icons.check_circle : Icons.radio_button_unchecked),
-          const SizedBox(width: 10),
-          Expanded(child: Text(label)),
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: active
+                    ? scheme.primary.withValues(alpha: 0.12)
+                    : scheme.surface,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(6),
+                child: Icon(
+                  icon,
+                  color: active ? scheme.primary : scheme.outline,
+                  size: 20,
+                ),
+              ),
+            ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            ),
+          ),
         ],
       ),
     );
@@ -524,95 +633,124 @@ class _ConfigTile extends StatelessWidget {
         ? [_socks5Summary(profile.primaryMapping)]
         : profile.mappings.map(_mappingSummary).toList();
     return Card(
-      margin: const EdgeInsets.symmetric(vertical: 5),
-      color: selected ? scheme.secondaryContainer : null,
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      color: selected ? scheme.secondaryContainer : scheme.surface,
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(8),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 10, 8, 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Icon(
-                    running
-                        ? Icons.cloud_done
-                        : selected
-                        ? Icons.radio_button_checked
-                        : Icons.radio_button_unchecked,
-                    color: running || selected
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Container(
+                  width: 4,
+                  decoration: BoxDecoration(
+                    color: running
                         ? scheme.primary
-                        : scheme.outline,
+                        : selected
+                        ? scheme.secondary
+                        : scheme.outlineVariant,
+                    borderRadius: const BorderRadius.horizontal(
+                      left: Radius.circular(8),
+                    ),
                   ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      profile.name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 8, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        running
+                            ? Icons.cloud_done_outlined
+                            : selected
+                            ? Icons.bookmark
+                            : Icons.bookmark_border,
+                        color: running || selected
+                            ? scheme.primary
+                            : scheme.outline,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          profile.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      _KindChip(label: profile.kind.label),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Icon(Icons.dns_outlined, size: 16, color: scheme.outline),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          profile.serverAddr,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  for (final summary in summaries.take(4))
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        summary,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  _KindChip(label: profile.kind.label),
-                ],
-              ),
-              const SizedBox(height: 6),
-              Text(
-                profile.serverAddr,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-              const SizedBox(height: 2),
-              for (final summary in summaries.take(4))
-                Padding(
-                  padding: const EdgeInsets.only(top: 2),
-                  child: Text(
-                    summary,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                ),
-              if (summaries.length > 4)
-                Text(
-                  '+${summaries.length - 4} more forwards',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              const SizedBox(height: 4),
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '${profile.clientId} / ${profile.transport.wire}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                  if (summaries.length > 4)
+                    Text(
+                      '+${summaries.length - 4} more forwards',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
-                  ),
-                  IconButton(
-                    tooltip: 'Share',
-                    onPressed: onShare,
-                    icon: const Icon(Icons.qr_code_2),
-                  ),
-                  IconButton(
-                    tooltip: 'Edit',
-                    onPressed: onEdit,
-                    icon: const Icon(Icons.edit_outlined),
-                  ),
-                  IconButton(
-                    tooltip: 'Delete',
-                    onPressed: onDelete,
-                    icon: const Icon(Icons.delete_outline),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '${profile.clientId} / ${profile.transport.wire}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Share',
+                        onPressed: onShare,
+                        icon: const Icon(Icons.qr_code_2),
+                      ),
+                      IconButton(
+                        tooltip: 'Edit',
+                        onPressed: onEdit,
+                        icon: const Icon(Icons.edit_outlined),
+                      ),
+                      IconButton(
+                        tooltip: 'Delete',
+                        onPressed: onDelete,
+                        icon: const Icon(Icons.delete_outline),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
@@ -654,8 +792,15 @@ class _ActivityPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4),
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 2),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

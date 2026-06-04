@@ -10,19 +10,20 @@ use hmac::{Hmac, Mac};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use std::{
     collections::{HashMap, HashSet},
     env, io,
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     time::{Duration, sleep, timeout},
 };
 use tracing::{debug, info, warn};
@@ -34,7 +35,13 @@ const AES_NONCE_LEN: usize = 12;
 const DEFAULT_RAW_AES_INFO: &[u8] = b"erp-session-raw-aes-256-gcm-v2";
 #[cfg(unix)]
 const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
-const CONTROL_CHANNEL_CAPACITY: usize = 65_536;
+const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 262_144;
+const DEFAULT_LISTEN_BACKLOG: i32 = 65_535;
+const DEFAULT_MAX_PENDING_CONNECTIONS: usize = 262_144;
+const DEFAULT_MAX_AUTH_HANDSHAKES: usize = 65_536;
+const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_DATA_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_FD_BACKOFF: Duration = Duration::from_millis(100);
 
 trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -659,6 +666,112 @@ fn is_fd_exhaustion(err: &io::Error) -> bool {
     }
 }
 
+fn listen_backlog() -> i32 {
+    static VALUE: OnceLock<i32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env::var("ERP_LISTEN_BACKLOG")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .map(|value| value.clamp(1, i32::MAX))
+            .unwrap_or(DEFAULT_LISTEN_BACKLOG)
+    })
+}
+
+fn max_pending_connections() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env::var("ERP_MAX_PENDING")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_PENDING_CONNECTIONS)
+    })
+}
+
+fn max_auth_handshakes() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env::var("ERP_MAX_AUTH_HANDSHAKES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_AUTH_HANDSHAKES)
+    })
+}
+
+fn control_channel_capacity() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env::var("ERP_CONTROL_CHANNEL_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_CONTROL_CHANNEL_CAPACITY)
+    })
+}
+
+fn auth_timeout() -> Duration {
+    duration_from_env("ERP_AUTH_TIMEOUT_SECS", DEFAULT_AUTH_TIMEOUT)
+}
+
+fn data_session_timeout() -> Duration {
+    duration_from_env(
+        "ERP_DATA_SESSION_TIMEOUT_SECS",
+        DEFAULT_DATA_SESSION_TIMEOUT,
+    )
+}
+
+fn connect_timeout() -> Duration {
+    duration_from_env("ERP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT)
+}
+
+fn duration_from_env(name: &'static str, default: Duration) -> Duration {
+    static AUTH: OnceLock<Duration> = OnceLock::new();
+    static DATA: OnceLock<Duration> = OnceLock::new();
+    static CONNECT: OnceLock<Duration> = OnceLock::new();
+    let slot = match name {
+        "ERP_AUTH_TIMEOUT_SECS" => &AUTH,
+        "ERP_DATA_SESSION_TIMEOUT_SECS" => &DATA,
+        "ERP_CONNECT_TIMEOUT_SECS" => &CONNECT,
+        _ => return default,
+    };
+    *slot.get_or_init(|| {
+        env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(default)
+    })
+}
+
+fn bind_tcp_listener<A>(addr: A) -> Result<TcpListener>
+where
+    A: ToSocketAddrs,
+{
+    let addr = addr
+        .to_socket_addrs()?
+        .next()
+        .context("listen address did not resolve")?;
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(SocketProtocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(listen_backlog())?;
+    socket.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(socket.into())?)
+}
+
+fn tune_tcp_stream(stream: &TcpStream) {
+    if let Err(err) = stream.set_nodelay(true) {
+        debug!("failed to enable TCP_NODELAY: {err}");
+    }
+}
+
 async fn accept_tunnel(stream: TcpStream, tunnel: &ServerTunnel) -> Result<BoxedStream> {
     let _ = tunnel;
     Ok(Box::new(stream))
@@ -666,14 +779,16 @@ async fn accept_tunnel(stream: TcpStream, tunnel: &ServerTunnel) -> Result<Boxed
 
 async fn connect_tunnel(addr: &str, tunnel: &ClientTunnel) -> Result<BoxedStream> {
     let _ = tunnel;
-    Ok(Box::new(TcpStream::connect(addr).await?))
+    let stream = TcpStream::connect(addr).await?;
+    tune_tcp_stream(&stream);
+    Ok(Box::new(stream))
 }
 
 async fn run_server(config: Config) -> Result<()> {
     let server = config.server.clone().context("missing server config")?;
     let tunnel = build_server_tunnel(config.transport, &server)?;
     let control_addr = format!("{}:{}", server.bind_addr, server.control_port);
-    let listener = TcpListener::bind(&control_addr).await?;
+    let listener = bind_tcp_listener(control_addr.as_str())?;
     let state = Arc::new(ServerState::default());
     let direct_socket = Arc::new(UdpSocket::bind(&control_addr).await?);
     *state.direct_socket.lock().await = Some(direct_socket.clone());
@@ -683,6 +798,7 @@ async fn run_server(config: Config) -> Result<()> {
         config.token.clone(),
         config.transport,
     );
+    let auth_slots = Arc::new(Semaphore::new(max_auth_handshakes()));
     info!("server listening on {}", control_addr);
 
     loop {
@@ -695,10 +811,16 @@ async fn run_server(config: Config) -> Result<()> {
             }
             Err(err) => return Err(err.into()),
         };
+        tune_tcp_stream(&stream);
+        let Ok(auth_slot) = auth_slots.clone().try_acquire_owned() else {
+            debug!("dropping control connection from {addr}: auth handshake limit reached");
+            continue;
+        };
         let state = state.clone();
         let token = config.token.clone();
         let tunnel = tunnel.clone();
         tokio::spawn(async move {
+            let _auth_slot = auth_slot;
             let result = async {
                 let stream = accept_tunnel(stream, &tunnel).await?;
                 handle_server_conn(stream, state, token, tunnel.transport).await
@@ -741,15 +863,24 @@ async fn handle_server_conn(
     token: String,
     transport: Transport,
 ) -> Result<()> {
-    let crypto = authenticate_server_side(&mut stream, &token, transport).await?;
-    let mut recv_counter = 0;
-    let frame = read_session_frame(
-        &mut stream,
-        &crypto,
-        Direction::ClientToServer,
-        &mut recv_counter,
+    let crypto = timeout(
+        auth_timeout(),
+        authenticate_server_side(&mut stream, &token, transport),
     )
-    .await?;
+    .await
+    .map_err(|_| anyhow!("auth timed out"))??;
+    let mut recv_counter = 0;
+    let frame = timeout(
+        auth_timeout(),
+        read_session_frame(
+            &mut stream,
+            &crypto,
+            Direction::ClientToServer,
+            &mut recv_counter,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("initial frame timed out"))??;
     match frame {
         Frame::Register { mappings } => {
             handle_registration(
@@ -798,7 +929,7 @@ async fn handle_registration(
         read_counter,
     );
     let mut writer = FrameWriter::new(writer_half, crypto.clone(), Direction::ServerToClient, 0);
-    let (tx, mut rx) = mpsc::channel::<Frame>(CONTROL_CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<Frame>(control_channel_capacity());
     let mut listener_tasks = Vec::new();
     let owned_mappings = mappings
         .iter()
@@ -935,7 +1066,7 @@ async fn spawn_tcp_listener(
     state: Arc<ServerState>,
     tx: mpsc::Sender<Frame>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let listener = TcpListener::bind(("0.0.0.0", remote_port)).await?;
+    let listener = bind_tcp_listener(SocketAddr::from(([0, 0, 0, 0], remote_port)))?;
     info!("tcp remote port {} listening", remote_port);
     let task = tokio::spawn(async move {
         loop {
@@ -952,30 +1083,38 @@ async fn spawn_tcp_listener(
                     continue;
                 }
             };
+            tune_tcp_stream(&inbound);
             let state = state.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
                 let conn_id = next_id();
                 let (sender, receiver) = oneshot::channel();
-                state.pending.lock().await.insert(
-                    conn_id,
-                    PendingData {
-                        remote_port,
-                        sender,
-                    },
-                );
+                {
+                    let mut pending = state.pending.lock().await;
+                    if pending.len() >= max_pending_connections() {
+                        debug!("dropping tcp {remote_port}: pending data limit reached");
+                        return;
+                    }
+                    pending.insert(
+                        conn_id,
+                        PendingData {
+                            remote_port,
+                            sender,
+                        },
+                    );
+                }
                 if tx
-                    .send(Frame::OpenTcp {
+                    .try_send(Frame::OpenTcp {
                         conn_id,
                         remote_port,
                     })
-                    .await
                     .is_err()
                 {
                     let _ = state.pending.lock().await.remove(&conn_id);
+                    debug!("dropping tcp {remote_port}: control channel is full or closed");
                     return;
                 }
-                match timeout(Duration::from_secs(10), receiver).await {
+                match timeout(data_session_timeout(), receiver).await {
                     Ok(Ok(outbound)) => {
                         let _ = relay_tcp_stream(
                             inbound,
@@ -1021,14 +1160,12 @@ async fn spawn_udp_listener(
             match udp_mode {
                 UdpMode::OverTcp => {
                     let conn_id = next_id();
-                    let _ = tx
-                        .send(Frame::OpenUdp {
-                            conn_id,
-                            remote_port,
-                            payload,
-                            peer,
-                        })
-                        .await;
+                    let _ = tx.try_send(Frame::OpenUdp {
+                        conn_id,
+                        remote_port,
+                        payload,
+                        peer,
+                    });
                 }
                 UdpMode::Direct => {
                     let route = state.direct_routes.lock().await.get(&remote_port).cloned();
@@ -1243,7 +1380,7 @@ async fn run_client(config: Config) -> Result<()> {
         recv_counter,
     );
     let mut writer = FrameWriter::new(writer, crypto, Direction::ClientToServer, send_counter);
-    let (tx, mut rx) = mpsc::channel::<Frame>(CONTROL_CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<Frame>(control_channel_capacity());
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if writer.write_frame(&frame).await.is_err() {
@@ -1312,7 +1449,12 @@ async fn open_tcp_data(
         .iter()
         .find(|mapping| mapping.remote_port == remote_port && mapping.protocol == Protocol::Tcp)
         .context("missing tcp mapping")?;
-    let mut server_stream = connect_tunnel(&client.server_addr, &tunnel).await?;
+    let mut server_stream = timeout(
+        connect_timeout(),
+        connect_tunnel(&client.server_addr, &tunnel),
+    )
+    .await
+    .map_err(|_| anyhow!("server data connection timed out"))??;
     let crypto = authenticate_client_side(
         &mut server_stream,
         &token,
@@ -1329,7 +1471,10 @@ async fn open_tcp_data(
         &Frame::DataStart { conn_id },
     )
     .await?;
-    let local = TcpStream::connect(&mapping.local_addr).await?;
+    let local = timeout(connect_timeout(), TcpStream::connect(&mapping.local_addr))
+        .await
+        .map_err(|_| anyhow!("local tcp connection timed out"))??;
+    tune_tcp_stream(&local);
     relay_tcp_stream(
         local,
         DataSession {

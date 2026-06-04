@@ -3,14 +3,15 @@ import 'package:erp_gui/share_codec.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('default erp link round trips profile without passphrase', () async {
+  test('short erp link round trips profile', () async {
     final codec = ShareCodec();
     final profile = ErpProfile.starter();
 
     final link = await codec.encodePlain(profile);
     final decoded = await codec.decode(link);
 
-    expect(link, startsWith('erp://import?payload='));
+    expect(link, startsWith('erp://i/'));
+    expect(link.length, lessThan(360));
     expect(link, isNot(contains('Android')));
     expect(link, isNot(contains('android-phone')));
     expect(link, isNot(contains('127.0.0.1')));
@@ -22,15 +23,12 @@ void main() {
     );
   });
 
-  test('encrypted erp link requires matching passphrase', () async {
+  test('old erp import payload format is not accepted', () async {
     final codec = ShareCodec();
-    final profile = ErpProfile.starter();
 
-    final link = await codec.encodeEncrypted(profile, 'secret-passphrase');
-    final decoded = await codec.decode(link, 'secret-passphrase');
-
-    expect(link, startsWith('erp://import?payload='));
-    expect(decoded.serverAddr, profile.serverAddr);
-    await expectLater(codec.decode(link, 'wrong'), throwsA(isA<Object>()));
+    await expectLater(
+      codec.decode('erp://import?payload=abc'),
+      throwsA(isA<FormatException>()),
+    );
   });
 }

@@ -25,7 +25,7 @@ From `erp-gui/`:
 
 - `flutter pub get`, `flutter analyze`, `flutter test`: install dependencies and run checks.
 - `.\tool\build_android_runtime.ps1`: build bundled Android `erp` runtimes for `arm64-v8a` and `x86_64`.
-- `flutter build apk --release --split-per-abi --target-platform android-arm64,android-x64`: build signed split APKs.
+- `flutter build apk --release --split-per-abi --target-platform android-arm64,android-x64`: build signed split APKs. If Gradle cache locks remain on Windows, add `--android-project-cache-dir $env:TEMP\erp-gradle-project-cache`.
 - `flutter build windows --release`: build the Windows GUI.
 
 ## Coding Style & Naming Conventions
@@ -36,7 +36,7 @@ Use `rustfmt` for Rust and `dart format` for Flutter. Rust uses `snake_case` for
 
 Add Rust tests for forwarding, authentication, encryption, cleanup, and config parsing. Keep unit tests near the code and end-to-end cases in `erp/tests/`. Add Flutter tests for profile editing, sharing links, QR/export, and SOCKS5 UI state.
 
-For remote validation, use `root@phi.nam2.uk`: binary `/root/erp`, server config `/root/server.toml`. Before load testing, verify `/proc/<pid>/limits` shows `Max open files` near `1048576`. For Android, install `erp-gui-arm64-v8a.apk`, confirm `lib/arm64-v8a/liberp_exec.so`, start the app, and check logcat.
+For remote validation, use `root@phi.nam2.uk`: binary `/root/erp`, server config `/root/server.toml`. Start high-load servers with `ulimit -n 1048576` plus `ERP_NOFILE=1048576`, `ERP_LISTEN_BACKLOG=65535`, `ERP_MAX_AUTH_HANDSHAKES`, `ERP_MAX_PENDING`, and `ERP_CONTROL_CHANNEL_CAPACITY` tuned for the test. Before load testing, verify `/proc/<pid>/limits` shows `Max open files` near `1048576`. For Android, install `erp-gui-arm64-v8a.apk`, confirm `lib/arm64-v8a/liberp_exec.so`, start the app, and check logcat.
 
 ## Release & Signing Notes
 
